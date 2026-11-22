@@ -3,7 +3,7 @@
   "productName": "TennoScope",
   "mainBinaryName": "tennoscope",
   "version": "0.14.0",
-  "identifier": "io.github.deftera186.tennoscope",
+  "identifier": "io.github.ilelly2.tennoscope",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -70,7 +70,7 @@
     "category": "Utility",
     "license": "GPL-3.0-only",
     "licenseFile": "../../LICENSE",
-    "homepage": "https://github.com/Deftera186/tennoscope",
+    "homepage": "https://github.com/ilelly2/tennoscope",
     "publisher": "Deftera186",
     "shortDescription": "Local-first Warframe collection and relic companion",
     "longDescription": "TennoScope reads a running Warframe process without modifying it and keeps a local copy of your collection. When a relic cracks it recognises the rewards on screen and prices them in platinum and ducats from warframe.market, counting only sellers who are online. No account, no telemetry, no Overwolf.",
@@ -114,9 +114,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM3Nzc4RDY5MTAwNkNCMEMKUldRTXl3WVFhWTEzTi9nc0NlNTFwemc4Rm5xdGJRZE9CY2JkdWt2WHc5b3BzODR0N2Y5UDZlS1AK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM1MTlDNzBCODI3MjdFRgpSV1R2SnllNGNKeFJEQjc5V0w2MU05WVFIbmhia256N2s3TnNyMkxWNzhWQU9MREUzaGdpbU5lMgo=",
       "endpoints": [
-        "https://github.com/Deftera186/tennoscope/releases/latest/download/latest.json"
+        "https://github.com/ilelly2/tennoscope/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

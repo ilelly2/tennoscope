@@ -112,7 +112,9 @@ if [ -n "$notes_file" ]; then
 fi
 
 pub_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-repo="https://github.com/Deftera186/tennoscope"
+# The feed must point at the repository that published the release, so a fork
+# serves its own downloads; outside Actions it falls back to upstream.
+repo="https://github.com/${GITHUB_REPOSITORY:-Deftera186/tennoscope}"
 
 export FEED_VERSION="$version" FEED_TAG="$tag" FEED_DATE="$pub_date" FEED_NOTES="$notes"
 export FEED_ENTRIES="$entries_tmp" FEED_OUT="$out" FEED_PRERELEASE="$is_prerelease" FEED_REPO="$repo"
