@@ -577,10 +577,15 @@ impl AppCore {
                     .map(AcquisitionStageView::from)
                     .collect();
                 self.health.catalog = match catalog {
-                    Some((CatalogLoadSource::Network, fetched)) => BackendHealth::ready(
-                        "Current WFCD catalog loaded",
-                        Some(fetched.to_string()),
-                    )?,
+                    // `FreshCache` cannot arrive here: the item catalog's `load` has no age
+                    // check and reports only `Network` or `StaleCache`. It shares the ready row
+                    // because a young cached generation would be current if it ever did.
+                    Some((CatalogLoadSource::Network | CatalogLoadSource::FreshCache, fetched)) => {
+                        BackendHealth::ready(
+                            "Current WFCD catalog loaded",
+                            Some(fetched.to_string()),
+                        )?
+                    }
                     Some((CatalogLoadSource::StaleCache, fetched)) => BackendHealth::new(
                         HealthState::Degraded,
                         "Using cached WFCD catalog",

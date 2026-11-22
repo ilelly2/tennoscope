@@ -10,7 +10,11 @@ const backend = vi.hoisted(() => ({
   getVersionInfo: vi.fn(), updateCheck: vi.fn(), updateDownloadAndInstall: vi.fn(),
   getPreferences: vi.fn(), setMasteryMarks: vi.fn(),
 }))
-const overlay = vi.hoisted(() => ({ showRewardOverlay: vi.fn(), hideRewardOverlay: vi.fn() }))
+const overlay = vi.hoisted(() => ({
+  showRewardOverlay: vi.fn(),
+  hideRewardOverlay: vi.fn(),
+  getRewardOverlayVisibility: vi.fn(async () => false),
+}))
 const windowApi = vi.hoisted(() => ({
   minimizeWindow: vi.fn(),
   toggleMaximizeWindow: vi.fn(),
@@ -21,7 +25,15 @@ const windowApi = vi.hoisted(() => ({
 vi.mock('./backend', () => backend)
 vi.mock('./overlay', () => overlay)
 vi.mock('./window', () => windowApi)
-vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }))
+const events = vi.hoisted(() => ({
+  listeners: new Map<string, (event: { payload: unknown }) => void>(),
+}))
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn((name: string, handler: (event: { payload: unknown }) => void) => {
+    events.listeners.set(name, handler)
+    return Promise.resolve(() => { events.listeners.delete(name) })
+  }),
+}))
 vi.mock('@tauri-apps/plugin-opener', () => ({ openUrl: vi.fn(() => Promise.resolve()) }))
 vi.mock('@tauri-apps/plugin-clipboard-manager', () => ({ writeText: vi.fn(() => Promise.resolve()) }))
 vi.mock('@tauri-apps/plugin-process', () => ({ relaunch: vi.fn(() => Promise.resolve()) }))
@@ -149,7 +161,7 @@ const equipView: AppView = {
 }
 
 describe('MVP desktop interface', () => {
-  afterEach(() => { cleanup(); vi.useRealTimers() })
+  afterEach(() => { cleanup(); vi.useRealTimers(); events.listeners.clear() })
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()  // The price floor outlives a render, which is the point of it.
@@ -178,6 +190,15 @@ describe('MVP desktop interface', () => {
     backend.getPreferences.mockResolvedValue({ mastery_marks: true })
     backend.setMasteryMarks.mockResolvedValue({ mastery_marks: true })
     overlay.hideRewardOverlay.mockResolvedValue(undefined)
+    overlay.getRewardOverlayVisibility.mockResolvedValue(false)
+    // The backend owns the strip's visibility and reports the new state once a command lands.
+    // The mock does the same, so the toggle never guesses.
+    overlay.showRewardOverlay.mockImplementation(async () => {
+      events.listeners.get('reward-overlay-visibility')?.({ payload: { visible: true, cards: 4 } })
+    })
+    overlay.hideRewardOverlay.mockImplementation(async () => {
+      events.listeners.get('reward-overlay-visibility')?.({ payload: { visible: false, cards: 0 } })
+    })
     // Every mount reads the window's state once and subscribes for more; tests that never touch
     // the controls still need those promises to resolve.
     windowApi.minimizeWindow.mockResolvedValue(undefined)
@@ -701,6 +722,46 @@ describe('MVP desktop interface', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'About' }))
     expect(screen.getByText(/stored on this device/i)).toBeInTheDocument()
+  })
+
+  it('the overlay toggle reflects the visibility the backend reports', async () => {
+    backend.getSetupStatus.mockResolvedValue({ setup_complete: true, access_mode: 'full', desktop_capture_action_available: false })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Your collection' })
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }))
+
+    await userEvent.click(screen.getByRole('button', { name: 'Preview reward overlay' }))
+    expect(overlay.showRewardOverlay).toHaveBeenCalledOnce()
+    await screen.findByRole('button', { name: 'Hide reward overlay' })
+
+    // The reward screen closed on its own: the backend hid the strip and said so. The toggle
+    // never saw that happen, so without the report it would still offer to hide a strip that is
+    // already gone.
+    await act(async () => {
+      events.listeners.get('reward-overlay-visibility')?.({ payload: { visible: false, cards: 0 } })
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Preview reward overlay' })).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Preview reward overlay' })).toHaveAttribute('aria-pressed', 'false')
+
+    // And a live screen showing up brings the toggle back in step without a click.
+    await act(async () => {
+      events.listeners.get('reward-overlay-visibility')?.({ payload: { visible: true, cards: 3 } })
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Hide reward overlay' })).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Hide reward overlay' })).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('starts the overlay toggle from the state the backend already has', async () => {
+    // The strip can already be up when the Settings page mounts. The visibility event reports
+    // changes from now on, so without asking for the current state the toggle would offer to
+    // show a strip that is already there.
+    overlay.getRewardOverlayVisibility.mockResolvedValue(true)
+    backend.getSetupStatus.mockResolvedValue({ setup_complete: true, access_mode: 'full', desktop_capture_action_available: false })
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Your collection' })
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }))
+
+    expect(await screen.findByRole('button', { name: 'Hide reward overlay' })).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('explains automatic capture without portal controls', async () => {

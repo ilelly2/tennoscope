@@ -117,11 +117,13 @@ pub fn card_block_width(cards: usize, height: u32) -> f32 {
 const TITLE_TOP: f32 = 408.0 / 1080.0;
 const TITLE_HEIGHT: f32 = 58.0 / 1080.0;
 
-/// Below this, the read is treated as a failure rather than published as a guess.
-const MATCH_FLOOR: f32 = 0.6;
 /// Below this a read is still published, but its crop is kept for diagnosis. Every labelled card
 /// reads exactly once the title is separated from the card art, so anything under 0.85 is an
 /// anomaly worth having the pixels for.
+///
+/// This is debug-only crop retention, not an admission band. It must never be merged with the
+/// trusted band: the trusted band decides whether a name may be published at all, while this one
+/// only decides whether the pixels are worth keeping.
 #[cfg(debug_assertions)]
 const CROP_KEEP_BELOW: f32 = 0.85;
 
@@ -260,6 +262,14 @@ pub fn read_cards_in(
 
 const BLANK_CARD: &str = "a reward card read as blank";
 
+/// The card's text did not identify a reward.
+///
+/// This exact string is the contract with `reward_recognition`, which treats it and the blank as
+/// the two routine misses and warns immediately on anything else. A card that named nothing
+/// because the read was ambiguous is still a routine miss, so it carries this string and not a
+/// new one.
+const POOL_MISS: &str = "reward card text did not match the relic pool";
+
 /// Reads the `cards` title slots of one layout, stopping at the first that will not match. The
 /// failing slot comes back with the reason because `read_cards` needs to know whether the *first*
 /// slot was the one that failed, which is what tells a misplaced block apart from a pool gap.
@@ -281,20 +291,21 @@ fn read_cards_at(
             (TITLE_HEIGHT * height as f32) as u32,
         )
         .map_err(|reason| (slot, reason))?;
-        let matched = best_card_match(&text, candidates);
+        let reading = resolve_card(&text, candidates);
         // Without the raw text a failed read is unattributable: reading the wrong place, reading a
         // screen that is not the reward screen, and reading a card whose name is not in the pool
         // all surface as the same error. The text alone is not enough either: a misplaced crop
         // yields clean-looking wrong words rather than obvious garbage, which is how the title box
         // stayed 10px too low for five live runs. Keep the pixels behind a poor read.
         #[cfg(debug_assertions)]
-        let keep_crop = matched
-            .as_ref()
-            .is_none_or(|(_, score)| *score < CROP_KEEP_BELOW);
+        let keep_crop = match &reading {
+            CardReading::Named { score, .. } => *score < CROP_KEEP_BELOW,
+            _ => true,
+        };
         #[cfg(not(debug_assertions))]
         let keep_crop = false;
         log::debug!(
-            "[DEBUG-card] cards={cards} slot={slot} raw={text:?} match={matched:?} crop={}",
+            "[DEBUG-card] cards={cards} slot={slot} raw={text:?} match={reading:?} crop={}",
             if keep_crop {
                 crop.display().to_string()
             } else {
@@ -306,14 +317,12 @@ fn read_cards_at(
         }
         // Blank means no text, not no match: with an empty pool an unmatched card has no match
         // either, and taking it for blank would let `read_cards_in` read a four-card screen's
-        // middle two as a whole two-card screen.
-        if normalise(&text).is_empty() {
-            return Err((slot, BLANK_CARD));
+        // middle two as a whole two-card screen. A read that named nothing because it was
+        // ambiguous is a pool miss, and a pool miss is routine.
+        match reading {
+            CardReading::Named { name, score, .. } => read.push((name, score)),
+            unnamed => return Err((slot, unnamed_reason(&unnamed))),
         }
-        let Some(card) = matched.filter(|(_, score)| *score >= MATCH_FLOOR) else {
-            return Err((slot, "reward card text did not match the relic pool"));
-        };
-        read.push(card);
     }
     Ok(read)
 }
@@ -571,22 +580,42 @@ fn normalise(text: &str) -> String {
         .collect()
 }
 
-/// How near-exact a fragment of a read must be before it may name the whole card.
+/// How near-exact a read must be to speak for a whole card, as percentage integers rather than
+/// scores. Admission in the matcher is [`within_band`] on an exact edit count, so no float
+/// rounding can move a card across a threshold; `1.0 - edits/span` is computed only to be
+/// reported, to the log and to the UI's confidence.
 ///
-/// Scoring fragments is what lets a card be found under the specks Tesseract returns at
-/// `--psm 11`, but it cannot be done at `MATCH_FLOOR`: `blueprint` is a suffix of most rewards
-/// and alone scores 0.64 against `Forma Blueprint`, so a mis-crop that recovers one generic word
-/// would resolve to a confident wrong reward. Measured: `WOH DIGeil / Blueprint`, this file's
-/// own 2026-08-20 wrong-monitor read, scored 0.56 and was rejected before fragments were
-/// scored, and 0.64 and accepted after. A fragment has to be a near-exact match to speak.
-const PARTIAL_MATCH_FLOOR: f32 = 0.85;
+/// No f32 decides admission anywhere in this crate. The float scores exist to be reported, and
+/// every threshold that names or refuses a reward is an integer edit budget.
+///
+/// The trusted band is what lets a fragment of a read name a card at all. Scoring fragments is
+/// how a card is found under the specks Tesseract returns at `--psm 11`, but it cannot be done at
+/// the pool's band: `blueprint` is a suffix of most rewards and alone scores 0.64 against `Forma
+/// Blueprint`, so a mis-crop that recovers one generic word would resolve to a confident wrong
+/// reward. Measured: `WOH DIGeil / Blueprint`, this file's own 2026-08-20 wrong-monitor read,
+/// scored 0.56 and was rejected before fragments were scored, and 0.64 and accepted after. A
+/// fragment has to be a near-exact match to speak.
+const TRUSTED_EDITS_PERCENT: usize = 15;
+
+/// How near-exact a read of a pool reward must be for the pool's nearest name to name it.
+///
+/// The pool is a couple of dozen rewards, so a garbled read still has one clear nearest name.
+/// This is the band that decides whether the pool may name a card at all: 40% of the span in
+/// edits, which is the old 0.6 score floor expressed as an exact edit count.
+const POOL_EDITS_PERCENT: usize = 40;
 
 /// How near-exact a read must be to name a reward from outside the squad's pool.
 ///
 /// The pool is a couple of dozen rewards, so a garbled read still has one clear nearest name.
 /// Outside it there are hundreds of near neighbours, every part of every Prime, so only a
 /// near-exact read may name one.
-const CATALOG_MATCH_FLOOR: f32 = 0.9;
+const CATALOG_EDITS_PERCENT: usize = 10;
+
+/// Whether `edits` sits within `percent` of `span`. Integer multiplication, so the answer is
+/// exact whatever the score rounds to.
+fn within_band(edits: usize, span: usize, percent: usize) -> bool {
+    edits * 100 <= span * percent
+}
 
 /// The card's text split on blank lines, each group's own lines rejoined with a space.
 ///
@@ -616,21 +645,100 @@ fn text_groups(text: &str) -> Vec<String> {
     groups
 }
 
-/// The best match for a card among `candidates`.
+/// Where a named card came from: the squad's relic pool, or the reward catalogue behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchSource {
+    Pool,
+    Catalog,
+}
+
+/// The nearest candidate to a piece of a card's text, and how far it was.
 ///
-/// Two thresholds, because the two kinds of read carry different weight. The whole text is what
-/// the card actually said, so it is scored without a floor here; `read_cards_at` applies
-/// `MATCH_FLOOR` to the returned score. The whole text resolves a wrapped name, where
-/// `Dual Zoren Prime` and `Blueprint` each match nothing alone. A fragment is a guess about which
-/// part of the read is the name, so it only counts here at `PARTIAL_MATCH_FLOOR`: that is what
-/// recovers `Forma Blueprint` from under three specks of noise (0.64 -> 1.0) without letting a
-/// lone `Blueprint` name a card it cannot identify.
+/// `edits` and `span` are exact counts, and they are what every admission decision is made on.
+struct Nearest {
+    name: String,
+    /// The text this candidate was scored against, which is a fragment of the card whenever a
+    /// fragment won. It is the only valid thing to measure a rival against: comparing a whole
+    /// read to a fragment's name would charge the rival for text the winner never had to match.
+    read: String,
+    edits: usize,
+    /// The longer of the two names' lengths, and never zero, so the reported score cannot divide
+    /// by zero on a card whose text and candidates are both empty.
+    span: usize,
+    /// Which list this name was taken from. The pool and the catalogue have different bands, and
+    /// a catalogue name folded onto the pool's spelling is still a pool answer.
+    source: MatchSource,
+}
+
+impl Nearest {
+    /// The score the log and the UI's confidence see. Reported, never used to decide anything.
+    fn score(&self) -> f32 {
+        Self::score_of(self.edits, self.span)
+    }
+
+    fn score_of(edits: usize, span: usize) -> f32 {
+        1.0 - edits as f32 / span as f32
+    }
+
+    fn within(&self, percent: usize) -> bool {
+        within_band(self.edits, self.span, percent)
+    }
+
+    /// The band that decides whether this answer may name a card.
+    fn band_percent(&self) -> usize {
+        match self.source {
+            MatchSource::Pool => POOL_EDITS_PERCENT,
+            MatchSource::Catalog => CATALOG_EDITS_PERCENT,
+        }
+    }
+
+    fn pair(self) -> (String, f32) {
+        let score = self.score();
+        (self.name, score)
+    }
+}
+
+/// The nearest of `candidates` to `text`, or none when the text has nothing to compare.
+fn nearest(text: &str, candidates: &[RewardCatalogEntry], source: MatchSource) -> Option<Nearest> {
+    let read = normalise(text);
+    if read.is_empty() {
+        return None;
+    }
+    let read_length = read.chars().count();
+    candidates
+        .iter()
+        .map(|candidate| {
+            let known = normalise(&candidate.name);
+            let edits = edit_distance(&read, &known);
+            let span = read_length.max(known.chars().count()).max(1);
+            (candidate, edits, span)
+        })
+        .max_by(|(_, left, left_span), (_, right, right_span)| {
+            Nearest::score_of(*left, *left_span).total_cmp(&Nearest::score_of(*right, *right_span))
+        })
+        .map(|(candidate, edits, span)| Nearest {
+            name: candidate.name.clone(),
+            read,
+            edits,
+            span,
+            source,
+        })
+}
+
+/// The nearest of the pool to a card, scoring the whole read and then its fragments.
+///
+/// Two bands, because the two kinds of read carry different weight. The whole text is what the
+/// card actually said, so it is taken as it comes; the pool's band is applied to the result by the
+/// caller. The whole text resolves a wrapped name, where `Dual Zoren Prime` and `Blueprint` each
+/// match nothing alone. A fragment is a guess about which part of the read is the name, so it only
+/// counts at the trusted band: that is what recovers `Forma Blueprint` from under three specks of
+/// noise (0.64 -> 1.0) without letting a lone `Blueprint` name a card it cannot identify.
 ///
 /// Still a closed-set match: it returns the nearest of `candidates`, never "none of these", so the
-/// floors are the only guard against a confident wrong answer. Which names a card may reach at
-/// all is [`best_card_match`]'s call.
-pub fn best_match(text: &str, candidates: &[RewardCatalogEntry]) -> Option<(String, f32)> {
-    let whole = best_match_of(text, candidates);
+/// bands are the only guard against a confident wrong answer. Which names a card may reach at
+/// all is [`choose`]'s call.
+fn pool_nearest(text: &str, candidates: &[RewardCatalogEntry]) -> Option<Nearest> {
+    let whole = nearest(text, candidates, MatchSource::Pool);
     let groups = text_groups(text);
     let mut fragments = groups.clone();
     for start in 0..groups.len() {
@@ -639,9 +747,9 @@ pub fn best_match(text: &str, candidates: &[RewardCatalogEntry]) -> Option<(Stri
     // Deduped on the normalised form, because `normalise` strips the separators that are the only
     // difference between a wrapped name and its rejoined groups. On raw text every such pair
     // scores twice. Seeding with the whole text drops the `start == 0` run, which normalises to
-    // exactly it. That is to avoid a redundant pass over the pool, not to protect a floor: the
-    // whole text is scored above without a local floor either way, and a duplicate of it can only
-    // tie that score, never change the result whose score the caller checks against `MATCH_FLOOR`.
+    // exactly it. That is to avoid a redundant pass over the pool, not to protect a band: the
+    // whole text is scored above without a local band either way, and a duplicate of it can only
+    // tie that score, never change the result whose score the caller checks against the pool's.
     let mut seen = vec![normalise(text)];
     let mut distinct = Vec::with_capacity(fragments.len());
     for fragment in fragments {
@@ -654,11 +762,11 @@ pub fn best_match(text: &str, candidates: &[RewardCatalogEntry]) -> Option<(Stri
     }
     let best_fragment = distinct
         .iter()
-        .filter_map(|fragment| best_match_of(fragment, candidates))
-        .filter(|(_, score)| *score >= PARTIAL_MATCH_FLOOR)
-        .max_by(|(_, left), (_, right)| left.total_cmp(right));
+        .filter_map(|fragment| nearest(fragment, candidates, MatchSource::Pool))
+        .filter(|fragment| fragment.within(TRUSTED_EDITS_PERCENT))
+        .max_by(|left, right| left.score().total_cmp(&right.score()));
     match (whole, best_fragment) {
-        (Some(whole), Some(fragment)) => Some(if fragment.1 > whole.1 {
+        (Some(whole), Some(fragment)) => Some(if fragment.score() > whole.score() {
             fragment
         } else {
             whole
@@ -667,59 +775,196 @@ pub fn best_match(text: &str, candidates: &[RewardCatalogEntry]) -> Option<(Stri
     }
 }
 
-/// The best match for a card against the squad's pool, falling back to the reward catalogue.
+/// The card's best match against the squad's pool, falling back to the reward catalogue.
 ///
-/// A pool read at `PARTIAL_MATCH_FLOOR` or better stands untouched, so `Forma Blueprint` still
-/// names the pool's `2X Forma Blueprint` rather than the catalogue's `Forma Blueprint`. Below that
-/// the catalogue's answer counts only at `CATALOG_MATCH_FLOOR`, so it can name a card the pool is
-/// missing but never redirect a fuzzy read. A relic WFCD lists with no rewards left `Baza Prime
-/// Blueprint` out of a live pool, and its clean read was published as `Burston Prime Blueprint`.
+/// A pool read inside the trusted band stands untouched, so `Forma Blueprint` still names the
+/// pool's `2X Forma Blueprint` rather than the catalogue's `Forma Blueprint`. Below that the
+/// catalogue's answer counts only inside the catalogue's own, tighter band, so it can name a card
+/// the pool is missing but never redirect a fuzzy read. A relic WFCD lists with no rewards left
+/// `Baza Prime Blueprint` out of a live pool, and its clean read was published as `Burston Prime
+/// Blueprint`.
 ///
 /// The catalogue is scored on the card's whole text, never on a fragment of it. It lists a
 /// Warframe part's component beside its blueprint, so a wrapped `Lavos Prime Chassis Blueprint`
 /// whose second line read badly would otherwise be named `Lavos Prime Chassis` from its first.
 /// A catalogue answer the pool also lists under the relic table's spelling takes that spelling:
 /// a garbled `Forma Blueprint` read still names what the relic drops, `2X Forma Blueprint`.
-pub fn best_card_match(text: &str, candidates: CardCandidates<'_>) -> Option<(String, f32)> {
-    let pool = best_match(text, candidates.pool);
+fn choose(text: &str, candidates: CardCandidates<'_>) -> Option<Nearest> {
+    let pool = pool_nearest(text, candidates.pool);
     if pool
         .as_ref()
-        .is_some_and(|(_, score)| *score >= PARTIAL_MATCH_FLOOR)
+        .is_some_and(|nearest| nearest.within(TRUSTED_EDITS_PERCENT))
     {
         return pool;
     }
-    let catalog = best_match_of(text, candidates.catalog)
-        .filter(|(_, score)| *score >= CATALOG_MATCH_FLOOR)
-        .map(|(name, score)| {
-            let spelling = candidates
-                .pool
-                .iter()
-                .find(|entry| warframe_acquisition::reward_name_matches(&name, &entry.name))
-                .map_or(name, |entry| entry.name.clone());
-            (spelling, score)
+    let catalog = nearest(text, candidates.catalog, MatchSource::Catalog)
+        .filter(|nearest| nearest.within(CATALOG_EDITS_PERCENT))
+        .map(|nearest| {
+            let spelling = candidates.pool.iter().find(|entry| {
+                warframe_acquisition::reward_name_matches(&nearest.name, &entry.name)
+            });
+            match spelling {
+                Some(entry) => Nearest {
+                    name: entry.name.clone(),
+                    // The pool's spelling is what names the card, so it is a pool answer and is
+                    // judged at the pool's band. The catalogue still supplied the match.
+                    source: MatchSource::Pool,
+                    ..nearest
+                },
+                None => nearest,
+            }
         });
     match (pool, catalog) {
-        (Some(pool), Some(catalog)) => Some(if catalog.1 > pool.1 { catalog } else { pool }),
+        (Some(pool), Some(catalog)) => Some(if catalog.score() > pool.score() {
+            catalog
+        } else {
+            pool
+        }),
         (pool, catalog) => pool.or(catalog),
     }
 }
 
-/// One read against `candidates`. This is the whole of what `best_match` used to be.
-fn best_match_of(text: &str, candidates: &[RewardCatalogEntry]) -> Option<(String, f32)> {
-    let read = normalise(text);
-    if read.is_empty() {
-        return None;
+/// Why a card's read named no reward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnknownReason {
+    /// No candidate was close enough to name.
+    BelowFloor,
+    /// A different reward sits within one edit of the read that named the winner, so the read
+    /// cannot say which of the two it saw.
+    Ambiguous,
+}
+
+/// What a card's read resolved to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CardReading {
+    /// The read named a reward, at the score it matched at.
+    Named {
+        name: String,
+        score: f32,
+        /// The exact edit count behind the score. Reported, never a threshold.
+        edits: usize,
+        source: MatchSource,
+    },
+    /// The read held no text at all.
+    Blank,
+    /// The read held text but named nothing.
+    Unknown(UnknownReason),
+}
+
+/// Why a card that named nothing failed its slot.
+///
+/// Both unknown reasons carry the same string: the card's text did not identify a reward. The
+/// recognition layer treats the pool miss as routine and any other reason as a capture failure,
+/// so an ambiguous screen must not warn as though the capture were broken.
+fn unnamed_reason(reading: &CardReading) -> &'static str {
+    match reading {
+        CardReading::Unknown(_) => POOL_MISS,
+        CardReading::Blank => BLANK_CARD,
+        // A named card never reaches here; the caller only asks about the ones that did not
+        // name. The arm exists because the match has to be exhaustive.
+        CardReading::Named { .. } => POOL_MISS,
     }
+}
+
+/// Whether another reward sits close enough to the winner that the read could have meant it.
+///
+/// Two conditions, and both are needed. The rival's name must sit within the winner's own edit
+/// budget plus one, because a name further out than that is not what makes the two rewards hard to
+/// tell apart. And the rival must itself be a plausible reading of the same text, at the trusted
+/// band, because otherwise the name distance is measuring the noise in the read rather than the
+/// reward.
+///
+/// The second condition is what keeps a noisy read of one reward from refusing to name it. The
+/// winner's own edit count grows with the noise in the read, and so does the budget this compares
+/// against, so a read carrying four stray characters would otherwise be within one edit of a
+/// reward the read plainly does not contain. The kiosk's labels are read with exactly that kind
+/// of noise, and a name the read plainly holds was being dropped for it.
+///
+/// The rival is measured against the winner's own scoring text, which is the fragment that won
+/// when a fragment won. Measuring against the whole read would charge the rival for text the
+/// winner never had to match.
+///
+/// A reward the pool and the catalogue spell differently is the same reward wearing two names,
+/// not a rival, so the names are compared through the same fold [`choose`] uses.
+fn rival_within_one_edit(winner: &Nearest, candidates: CardCandidates<'_>) -> bool {
+    let budget = winner.edits + 1;
+    let winner_name = normalise(&winner.name);
     candidates
+        .pool
         .iter()
-        .map(|candidate| {
-            let known = normalise(&candidate.name);
-            let distance = edit_distance(&read, &known);
-            let longest = read.chars().count().max(known.chars().count()).max(1);
-            let score = 1.0 - distance as f32 / longest as f32;
-            (candidate.name.clone(), score)
+        .chain(candidates.catalog.iter())
+        .any(|entry| {
+            if same_reward(&winner.name, &entry.name) {
+                return false;
+            }
+            let rival = normalise(&entry.name);
+            if edit_distance(&winner_name, &rival) > budget {
+                return false;
+            }
+            let span = winner.read.chars().count().max(rival.chars().count());
+            within_band(
+                edit_distance(&winner.read, &rival),
+                span,
+                TRUSTED_EDITS_PERCENT,
+            )
         })
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+}
+
+/// Whether two names are the same reward under either spelling.
+fn same_reward(left: &str, right: &str) -> bool {
+    warframe_acquisition::reward_name_matches(left, right)
+        || warframe_acquisition::reward_name_matches(right, left)
+}
+
+/// What a card's read resolves to: a named reward, a blank, or a reason it named nothing.
+///
+/// The scorer behind this answers with the nearest name whatever the read looks like, which is
+/// what makes it useful and what makes it unsafe on its own: a read one edit from one reward and
+/// two from its sibling scores well against the first and is published as it. This is where that
+/// becomes a decision instead of a score.
+///
+/// The order is deliberate. A blank read is a blank card, not a pool miss, and the two are not the
+/// same thing to the caller: a blank first slot means the block is narrower and a narrower layout
+/// may be tried, while a pool miss means the text was there and the pool did not have it.
+///
+/// Admission is an integer edit budget throughout. The float score is computed only to be
+/// reported, to the log and to the UI's confidence.
+pub fn resolve_card(text: &str, candidates: CardCandidates<'_>) -> CardReading {
+    if normalise(text).is_empty() {
+        return CardReading::Blank;
+    }
+    let Some(winner) = choose(text, candidates) else {
+        return CardReading::Unknown(UnknownReason::BelowFloor);
+    };
+    if !winner.within(winner.band_percent()) {
+        return CardReading::Unknown(UnknownReason::BelowFloor);
+    }
+    let score = winner.score();
+    let edits = winner.edits;
+    let source = winner.source;
+    if edits == 0 {
+        return CardReading::Named {
+            name: winner.name,
+            score,
+            edits,
+            source,
+        };
+    }
+    if rival_within_one_edit(&winner, candidates) {
+        return CardReading::Unknown(UnknownReason::Ambiguous);
+    }
+    CardReading::Named {
+        name: winner.name,
+        score,
+        edits,
+        source,
+    }
+}
+
+/// The best match for a card against the squad's pool, falling back to the reward catalogue.
+/// See [`choose`] for what wins, and why.
+pub fn best_card_match(text: &str, candidates: CardCandidates<'_>) -> Option<(String, f32)> {
+    choose(text, candidates).map(Nearest::pair)
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -862,6 +1107,234 @@ mod tests {
         }
     }
 
+    /// The relic pool alone, with no catalogue behind it: what every read had before a card
+    /// could be named from outside the pool.
+    fn pool_only(pool: &[super::RewardCatalogEntry]) -> super::CardCandidates<'_> {
+        super::CardCandidates { pool, catalog: &[] }
+    }
+
+    /// A read one edit from one reward and two from its sibling has not named either, however
+    /// good the nearest-name score looks. The scorer still answers; the resolver is where the
+    /// decision is made, so a wrong name is never published as a trusted one.
+    #[test]
+    fn an_ambiguous_read_names_nothing() {
+        let catalog = [
+            pool_entry("Gara Prime Neuroptics Blueprint"),
+            pool_entry("Garuda Prime Neuroptics Blueprint"),
+        ];
+        let read = "Gara Prime Neuroptics Blueprlnt";
+        assert_eq!(
+            super::resolve_card(
+                read,
+                super::CardCandidates {
+                    pool: &[],
+                    catalog: &catalog,
+                },
+            ),
+            super::CardReading::Unknown(super::UnknownReason::Ambiguous),
+        );
+        let (name, score) = super::best_card_match(
+            read,
+            super::CardCandidates {
+                pool: &[],
+                catalog: &catalog,
+            },
+        )
+        .expect("the scorer still names its nearest");
+        assert_eq!(name, "Gara Prime Neuroptics Blueprint");
+        assert!(score >= 0.9, "scored {score}");
+    }
+
+    /// An exact read is not ambiguous, however close its sibling is.
+    #[test]
+    fn an_exact_read_names_its_card_even_beside_a_sibling() {
+        let catalog = [
+            pool_entry("Gara Prime Neuroptics Blueprint"),
+            pool_entry("Gara Prime Neuroptic Blueprint"),
+        ];
+        assert_eq!(
+            super::resolve_card(
+                "Gara Prime Neuroptics Blueprint",
+                super::CardCandidates {
+                    pool: &[],
+                    catalog: &catalog,
+                },
+            ),
+            super::CardReading::Named {
+                name: "Gara Prime Neuroptics Blueprint".to_owned(),
+                score: 1.0,
+                edits: 0,
+                source: super::MatchSource::Catalog,
+            },
+        );
+    }
+
+    /// A sibling three edits from the winner's name cannot be what the read said, so it does not
+    /// block the name. The read is two edits from the sibling, inside the trusted band, so the
+    /// name-distance budget is the only thing that rejects it.
+    #[test]
+    fn a_rival_three_edits_away_does_not_block_the_name() {
+        let pool = [pool_entry("Paris Prime Lower Limb")];
+        let catalog = [pool_entry("Paris Prime Upper Limb")];
+        assert_eq!(
+            super::resolve_card(
+                "Paris Prime Uower Limb",
+                super::CardCandidates {
+                    pool: &pool,
+                    catalog: &catalog,
+                },
+            ),
+            super::CardReading::Named {
+                name: "Paris Prime Lower Limb".to_owned(),
+                score: 1.0 - 1.0 / 19.0,
+                edits: 1,
+                source: super::MatchSource::Pool,
+            },
+        );
+    }
+
+    /// The pool spells a stack's reward `2X Forma Blueprint` and the catalogue spells it
+    /// `Forma Blueprint`. Those are one reward wearing two names, not two rewards, so the
+    /// spelling difference must not read as ambiguity.
+    #[test]
+    fn a_catalogue_name_the_pool_spells_differently_is_not_a_rival() {
+        let pool = [
+            pool_entry("Kestrel Prime Grip"),
+            pool_entry("Alternox Prime Barrel"),
+            pool_entry("2X Forma Blueprint"),
+            pool_entry("Xaku Prime Neuroptics Blueprint"),
+            pool_entry("Burston Prime Blueprint"),
+            pool_entry("Lex Prime Barrel"),
+        ];
+        let mut catalog = pool.to_vec();
+        catalog.extend([
+            pool_entry("Baza Prime Blueprint"),
+            pool_entry("Burston Prime Barrel"),
+            pool_entry("Burston Prime Receiver"),
+            pool_entry("Burston Prime Stock"),
+            pool_entry("Braton Prime Blueprint"),
+            pool_entry("Braton Prime Barrel"),
+            pool_entry("Braton Prime Receiver"),
+            pool_entry("Braton Prime Stock"),
+            pool_entry("Forma Blueprint"),
+        ]);
+        assert_eq!(
+            super::resolve_card(
+                "Forma Bluepr1nt",
+                super::CardCandidates {
+                    pool: &pool,
+                    catalog: &catalog,
+                },
+            ),
+            super::CardReading::Named {
+                name: "2X Forma Blueprint".to_owned(),
+                score: 1.0 - 1.0 / 14.0,
+                edits: 1,
+                source: super::MatchSource::Pool,
+            },
+        );
+    }
+
+    /// The pool band's edge is inclusive: a read exactly 40% of its span away from the only pool
+    /// name still names it, which is the old 0.6 score floor expressed as an edit budget.
+    #[test]
+    fn a_read_exactly_on_the_pool_band_names_its_card() {
+        let name = "Athodai Prime Receiver";
+        assert_eq!(super::normalise(name).chars().count(), 20);
+        let pool = [pool_entry(name)];
+        assert_eq!(
+            super::resolve_card("qqqqqqq Qrime Receiver", pool_only(&pool)),
+            super::CardReading::Named {
+                name: name.to_owned(),
+                score: 1.0 - 8.0 / 20.0,
+                edits: 8,
+                source: super::MatchSource::Pool,
+            },
+        );
+        assert_eq!(
+            super::resolve_card("qqqqqqq Qqime Receiver", pool_only(&pool)),
+            super::CardReading::Unknown(super::UnknownReason::BelowFloor),
+            "a read past the pool band names nothing"
+        );
+    }
+
+    /// A fragment is a guess at which part of the read is the name, so its band is tighter than
+    /// the whole read's. The edge is inclusive: three edits of a twenty-character name.
+    #[test]
+    fn a_fragment_exactly_on_the_trusted_band_names_the_card() {
+        let name = "Athodai Prime Receiver";
+        let pool = [pool_entry(name)];
+        assert_eq!(
+            super::resolve_card("WOH DIGeilzzzz\n\nAthodoi Qrime Reqeiver", pool_only(&pool)),
+            super::CardReading::Named {
+                name: name.to_owned(),
+                score: 1.0 - 3.0 / 20.0,
+                edits: 3,
+                source: super::MatchSource::Pool,
+            },
+        );
+    }
+
+    /// A fragment four edits away over a span of twenty-four is 16.7%: inside the pool's band and
+    /// outside the trusted band, so it must not name the card. The whole read around it is
+    /// farther still.
+    #[test]
+    fn a_fragment_past_the_trusted_band_names_nothing() {
+        let name = "Athodai Prime Receiver";
+        let pool = [pool_entry(name)];
+        assert_eq!(
+            super::resolve_card(
+                "WOH DIGeilzzz\n\nAthodai Prime Receiverzzzz",
+                pool_only(&pool)
+            ),
+            super::CardReading::Unknown(super::UnknownReason::BelowFloor),
+        );
+    }
+
+    /// A blank read and a read that matched nothing are different answers. The first means the
+    /// crop was narrower than the card; the second means the card was not in the pool, and only
+    /// the first may let a narrower layout be tried.
+    #[test]
+    fn a_blank_read_is_not_a_pool_miss() {
+        let pool = [
+            pool_entry("Braton Prime Blueprint"),
+            pool_entry("2X Forma Blueprint"),
+            pool_entry("Burston Prime Stock"),
+            pool_entry("Trumna Prime Blueprint"),
+        ];
+        let blank = super::resolve_card("\n\n   ", pool_only(&pool));
+        let miss = super::resolve_card("Orokin Catalyst Blueprint", pool_only(&pool));
+        assert_eq!(blank, super::CardReading::Blank);
+        assert_eq!(
+            miss,
+            super::CardReading::Unknown(super::UnknownReason::BelowFloor)
+        );
+        assert_ne!(
+            super::unnamed_reason(&blank),
+            super::unnamed_reason(&miss),
+            "a blank first slot must be told apart from a pool miss, or the narrower layout is never tried"
+        );
+    }
+
+    /// An ambiguous card is a read that did not identify a reward, not a broken capture. The
+    /// recognition layer warns on any reason but the pool miss and the blank, so an ambiguous
+    /// screen must carry the pool miss's own string.
+    #[test]
+    fn an_ambiguous_card_is_a_routine_miss_not_a_capture_failure() {
+        assert_eq!(
+            super::unnamed_reason(&super::CardReading::Unknown(
+                super::UnknownReason::Ambiguous
+            )),
+            "reward card text did not match the relic pool",
+        );
+        assert_eq!(
+            super::unnamed_reason(&super::CardReading::Unknown(
+                super::UnknownReason::BelowFloor
+            )),
+            "reward card text did not match the relic pool",
+        );
+    }
+
     /// The 2026-08-22 report's own slot 1: Tesseract returns three noise fragments above the
     /// real name. Scoring the whole blob puts this at 0.636 against a 0.6 floor, so one more
     /// speck of noise would have discarded a correct read.
@@ -872,8 +1345,9 @@ mod tests {
             pool_entry("Wisp Prime Neuroptics Blueprint"),
             pool_entry("Dual Zoren Prime Blueprint"),
         ];
-        let (name, score) = super::best_match("&\n\nvr\n\ni STrTl\n\nForma Blueprint", &pool)
-            .expect("a noisy read still resolves");
+        let (name, score) =
+            super::best_card_match("&\n\nvr\n\ni STrTl\n\nForma Blueprint", pool_only(&pool))
+                .expect("a noisy read still resolves");
         assert_eq!(name, "Forma Blueprint");
         assert!(
             score > 0.9,
@@ -889,13 +1363,14 @@ mod tests {
             pool_entry("Dual Zoren Prime Blueprint"),
             pool_entry("Forma Blueprint"),
         ];
-        let (name, score) = super::best_match("Dual Zoren Prime\n\nBlueprint", &pool)
-            .expect("a wrapped name resolves");
+        let (name, score) =
+            super::best_card_match("Dual Zoren Prime\n\nBlueprint", pool_only(&pool))
+                .expect("a wrapped name resolves");
         assert_eq!(name, "Dual Zoren Prime Blueprint");
         assert!(score > 0.99, "scored {score} on an exact wrapped read");
     }
 
-    /// Scoring more candidates must not invent a match out of pure noise: the floor is the only
+    /// Scoring more candidates must not invent a match out of pure noise: the band is the only
     /// thing standing between a garbled read and a confident wrong answer.
     #[test]
     fn pure_noise_still_scores_below_the_match_floor() {
@@ -904,31 +1379,30 @@ mod tests {
             pool_entry("Wisp Prime Neuroptics Blueprint"),
         ];
         for noise in ["&\n\nvr\n\ni STrTl", "xx\n\nzzz qq"] {
-            let score = super::best_match(noise, &pool)
-                .map(|(_, score)| score)
-                .unwrap_or_default();
             assert!(
-                score < super::MATCH_FLOOR,
-                "{noise:?} scored {score}, at or above the {} floor",
-                super::MATCH_FLOOR
+                matches!(
+                    super::resolve_card(noise, pool_only(&pool)),
+                    super::CardReading::Unknown(_)
+                ),
+                "{noise:?} named a card out of pure noise"
             );
         }
 
         // Asserted as an absence rather than a low score: a score of 0.0 from `unwrap_or_default`
         // is below the floor whatever the implementation does, so it would pass vacuously.
         assert!(
-            super::best_match("\n\n\n", &pool).is_none(),
+            super::best_card_match("\n\n\n", pool_only(&pool)).is_none(),
             "a read with no alphanumerics has nothing to match and must be an absence"
         );
     }
 
     /// A mis-crop that recovers one generic word must not name a card. `Blueprint` is a suffix on
     /// most Warframe rewards, so alone it identifies nothing, yet it scores 0.64 against
-    /// `Forma Blueprint`, over the 0.6 floor.
+    /// `Forma Blueprint`, over the pool band.
     ///
     /// `WOH DIGeil` is this file's own recorded read of the 2026-08-20 wrong-monitor capture. That
-    /// bug surfaced as `reward card text did not match the relic pool`; scoring fragments at
-    /// `MATCH_FLOOR` would have turned it into a confident wrong reward instead.
+    /// bug surfaced as `reward card text did not match the relic pool`; scoring fragments at the
+    /// pool band would have turned it into a confident wrong reward instead.
     #[test]
     fn a_mis_cropped_read_that_recovers_one_generic_word_is_rejected() {
         let pool = [
@@ -937,14 +1411,12 @@ mod tests {
             pool_entry("Dual Zoren Prime Blueprint"),
         ];
         for mis_crop in ["WOH DIGeil\n\nBlueprint", "aaaa bbbb\n\ncccc\n\nBlueprint"] {
-            let score = super::best_match(mis_crop, &pool)
-                .map(|(_, score)| score)
-                .unwrap_or_default();
             assert!(
-                score < super::MATCH_FLOOR,
-                "{mis_crop:?} scored {score}, at or above the {} floor: one generic word is \
-                 naming a card it cannot identify",
-                super::MATCH_FLOOR
+                matches!(
+                    super::resolve_card(mis_crop, pool_only(&pool)),
+                    super::CardReading::Unknown(_)
+                ),
+                "{mis_crop:?} named a card: one generic word is naming a card it cannot identify"
             );
         }
     }
@@ -958,9 +1430,11 @@ mod tests {
             pool_entry("Forma Blueprint"),
             pool_entry("Wisp Prime Neuroptics Blueprint"),
         ];
-        let (name, score) =
-            super::best_match("&\r\n\r\nvr\r\n\r\ni STrTl\r\n\r\nForma Blueprint", &pool)
-                .expect("a CRLF read still resolves");
+        let (name, score) = super::best_card_match(
+            "&\r\n\r\nvr\r\n\r\ni STrTl\r\n\r\nForma Blueprint",
+            pool_only(&pool),
+        )
+        .expect("a CRLF read still resolves");
         assert_eq!(name, "Forma Blueprint");
         assert!(score > 0.9, "scored {score} on a CRLF read");
     }
@@ -973,8 +1447,9 @@ mod tests {
             pool_entry("Forma Blueprint"),
             pool_entry("Wisp Prime Neuroptics Blueprint"),
         ];
-        let (name, score) = super::best_match("&\n \nvr\n \ni STrTl\n \nForma Blueprint", &pool)
-            .expect("a read whose blank lines carry spaces still resolves");
+        let (name, score) =
+            super::best_card_match("&\n \nvr\n \ni STrTl\n \nForma Blueprint", pool_only(&pool))
+                .expect("a read whose blank lines carry spaces still resolves");
         assert_eq!(name, "Forma Blueprint");
         assert!(score > 0.9, "scored {score} on a space-separated read");
     }
@@ -989,8 +1464,9 @@ mod tests {
             pool_entry("Forma Blueprint"),
             pool_entry("Wisp Prime Neuroptics Blueprint"),
         ];
-        let (name, score) = super::best_match("vr\n\nDual Zoren Prime\n\nBlueprint", &pool)
-            .expect("a wrapped name under noise resolves");
+        let (name, score) =
+            super::best_card_match("vr\n\nDual Zoren Prime\n\nBlueprint", pool_only(&pool))
+                .expect("a wrapped name under noise resolves");
         assert_eq!(name, "Dual Zoren Prime Blueprint");
         // Asserted near-exact, not merely over the floor: the whole-text read already carries this
         // input to 0.92, because two chars of noise against a 25-char read is a small penalty. So

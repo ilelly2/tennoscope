@@ -16,7 +16,7 @@ use app_core::{AcquisitionPort, AppCore, AppView, InventoryRefreshOutcome, Prici
 use atomicwrites::{AtomicFile, OverwriteBehavior};
 use local_store::{SnapshotInstant, SnapshotMeta, StoreError};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use warframe_acquisition::{
     CatalogCache, CollectionPriceCache, InventoryAcquirer, InventoryHttpTransport,
     MarketPriceCache, RelicsRunHttp, WarmOutcome, WfcdCatalogHttp, dump_is_current, latest_dump,
@@ -62,13 +62,11 @@ pub use overlay_window::{
 pub use preferences::Preferences;
 pub use reward_capture::x11::{largest_warframe_window, warframe_window_from_xwininfo_tree};
 pub use reward_log::{RewardLogEvent, RewardLogMachine};
-pub use reward_observer::{
-    RewardObservation, RewardObserverState, match_reward_text, normalize_ocr,
-};
+pub use reward_observer::{RewardObservation, RewardObserverState};
 pub use reward_ocr::{
-    MAX_CARDS, ScreenRewardSource, TESSERACT_EXECUTABLE, best_card_match, best_match,
-    card_block_left, card_block_width, luma, normalize_contrast, ocr_crop, prepare_crop,
-    read_cards, read_cards_in, tesseract_program, threshold_inverted,
+    MAX_CARDS, ScreenRewardSource, TESSERACT_EXECUTABLE, best_card_match, card_block_left,
+    card_block_width, luma, normalize_contrast, ocr_crop, prepare_crop, read_cards, read_cards_in,
+    tesseract_program, threshold_inverted,
 };
 pub use reward_recognition::{
     FailureTrace, RecognitionTiming, RecognitionUpdate, RecognizedRewards, RewardPublication,
@@ -560,6 +558,22 @@ fn market_inventory_writes_authorized(runtime: &Runtime) -> Result<(), String> {
     }
 }
 type SharedRuntime = Arc<Mutex<Runtime>>;
+
+/// The overlay's visibility, as the main window's toggle needs it.
+///
+/// Broadcast on `reward-overlay-visibility` rather than addressed to the overlay window: the
+/// preview toggle lives in the main window, which must hear it too.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub(crate) struct RewardOverlayVisibility {
+    pub(crate) visible: bool,
+    pub(crate) cards: usize,
+}
+
+/// Whether the reward strip is up right now.
+///
+/// There is one overlay window per process, so this is process state. Keeping it out of
+/// [`Runtime`] also means a reader never waits on the runtime lock the writer holds while drawing.
+static REWARD_OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 async fn get_view(state: State<'_, SharedRuntime>) -> Result<AppView, String> {
@@ -2034,15 +2048,62 @@ fn show_reward_overlay(app: AppHandle, state: State<'_, SharedRuntime>) -> Resul
     let runtime = state
         .lock()
         .map_err(|_| "application state is unavailable".to_owned())?;
-    // The preview has no screen to measure, so it shows the full-squad strip.
+    let cards = preview_card_count(
+        runtime
+            .core
+            .current_view()
+            .map_err(|_| "the current view is unavailable".to_owned())?
+            .reward()
+            .cards()
+            .len(),
+    );
     show_reward_overlay_with(&runtime.setup, &runtime.transition, || {
-        overlay_window::show_reward_overlay(&app, reward_ocr::MAX_CARDS);
+        overlay_window::show_reward_overlay(&app, cards);
+        publish_reward_overlay_visibility(&app, true, cards);
     })
+}
+
+/// How wide the preview strip is drawn.
+///
+/// A live screen's width is its card count; the preview has no screen to measure, so it mirrors
+/// the last real read when there is one and falls back to the full-squad strip otherwise. A count
+/// outside 1..=4 cannot be drawn, so it takes the fallback rather than a nonsense width.
+fn preview_card_count(cards: usize) -> usize {
+    if (1..=reward_ocr::MAX_CARDS).contains(&cards) {
+        cards
+    } else {
+        reward_ocr::MAX_CARDS
+    }
 }
 
 #[tauri::command]
 fn hide_reward_overlay(app: AppHandle) {
     overlay_window::hide_reward_overlay(&app);
+    publish_reward_overlay_visibility(&app, false, 0);
+}
+
+/// Whether the reward strip is up right now.
+///
+/// The preview toggle needs the truth when it mounts. The visibility event reports the changes
+/// the listener sees, and a toggle that mounted after the last change would otherwise start from
+/// the wrong answer.
+#[tauri::command]
+fn get_reward_overlay_visibility() -> bool {
+    REWARD_OVERLAY_VISIBLE.load(Ordering::Acquire)
+}
+
+/// Record the strip's visibility and tell the frontend.
+///
+/// The sole writer of the flag and the event, so the two cannot disagree. The flag is what a
+/// toggle mounting later reads; the event is what a toggle already listening hears.
+pub(crate) fn publish_reward_overlay_visibility(app: &AppHandle, visible: bool, cards: usize) {
+    let payload = record_reward_overlay_visibility(visible, cards);
+    let _ = app.emit("reward-overlay-visibility", payload);
+}
+
+fn record_reward_overlay_visibility(visible: bool, cards: usize) -> RewardOverlayVisibility {
+    REWARD_OVERLAY_VISIBLE.store(visible, Ordering::Release);
+    RewardOverlayVisibility { visible, cards }
 }
 
 /// The kiosk window pulls the latest epoch through this rather than receiving the payload in the
@@ -2215,6 +2276,7 @@ pub fn run() {
             load_fake_session,
             show_reward_overlay,
             hide_reward_overlay,
+            get_reward_overlay_visibility,
             get_kiosk_view,
             market_status,
             market_sign_in,
@@ -2314,6 +2376,29 @@ mod tests {
         MarketResponse, MarketToken, MarketTransport,
     };
 
+    /// The toggle asks this when it mounts, so it must read back what the last show or hide
+    /// recorded. A getter that always says "hidden" would offer to show a strip already up.
+    #[test]
+    fn the_visibility_command_reports_what_the_last_show_or_hide_recorded() {
+        let shown = record_reward_overlay_visibility(true, 3);
+        assert!(get_reward_overlay_visibility(), "a shown strip reads as up");
+        assert_eq!(
+            serde_json::to_value(shown).expect("the payload serializes"),
+            serde_json::json!({ "visible": true, "cards": 3 }),
+            "the event carries the field names the frontend reads"
+        );
+
+        let hidden = record_reward_overlay_visibility(false, 0);
+        assert!(
+            !get_reward_overlay_visibility(),
+            "a hidden strip reads as down"
+        );
+        assert_eq!(
+            serde_json::to_value(hidden).expect("the payload serializes"),
+            serde_json::json!({ "visible": false, "cards": 0 })
+        );
+    }
+
     #[test]
     fn snapshot_clock_supplies_one_second_to_catalog_and_snapshot_metadata() {
         let time = UNIX_EPOCH + Duration::from_secs(1_785_492_000);
@@ -2346,6 +2431,26 @@ mod tests {
         assert!(
             main.get("minHeight").is_none(),
             "an X11 compositor may tile below the hint; WebKitGTK can stay blank until another resize"
+        );
+    }
+
+    /// The preview has no screen to measure, so it must not guess a width: it mirrors the last
+    /// real read when there is one and falls back to the full-squad strip for anything that
+    /// cannot be drawn.
+    #[test]
+    fn the_preview_strip_is_as_wide_as_the_live_screen() {
+        assert_eq!(preview_card_count(0), reward_ocr::MAX_CARDS, "no read yet");
+        for cards in 1..=reward_ocr::MAX_CARDS {
+            assert_eq!(
+                preview_card_count(cards),
+                cards,
+                "a {cards}-card screen draws {cards} cards"
+            );
+        }
+        assert_eq!(
+            preview_card_count(reward_ocr::MAX_CARDS + 1),
+            reward_ocr::MAX_CARDS,
+            "a count that cannot be drawn takes the fallback"
         );
     }
 

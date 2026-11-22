@@ -53,7 +53,7 @@ the next poll retries. This prevents transient unreadable frames from tearing do
 
 - Grid cells: crop each tile's label band, preprocess it with the reward OCR pipeline, run
   Tesseract in sparse-text mode, and closed-set match against prime-part names from
-  `CatalogIndex::reward_entries`. Slots below the match floor render nothing.
+  `CatalogIndex::reward_entries`. Slots outside the pool's edit band render nothing.
 - Basket rows: recognize item names inside the basket pane with the same closed-set matcher.
 - Stack quantities: independently OCR the optional bounded `N X` prefix with a digit/separator
   whitelist. Missing or malformed prefixes mean quantity one; the observed `K`/`k` Tesseract
@@ -159,7 +159,7 @@ flag stops the poller; a close arriving during OCR discards that in-flight resul
 ## Edge cases
 
 - **Partial last grid row / filtered inventory**: render only cells whose match clears the
-  floor; unmatched slots render nothing.
+  pool's band; unmatched slots render nothing.
 - **Hover card covering tiles**: covered cells fail independently and do not take other chips
   down. If no label band can be located, keep the last view and retry.
 - **Empty basket**: publish the grid without basket chips or a total chip.

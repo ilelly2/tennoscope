@@ -4,7 +4,7 @@
 //! read all-or-nothing because four cards are one squad's choice, while the kiosk is read
 //! per-slot. A hover card covers two tiles, a filtered inventory leaves the last row short, and
 //! a scroll parks rows half out of view. None of those may take the other chips down with
-//! them, so every crop stands on its own and slots that do not clear the match floor simply
+//! them, so every crop stands on its own and slots that do not clear the pool's band simply
 //! render nothing.
 //!
 //! It is not general OCR: every label only has to land on the nearest of the player's own prime
@@ -17,12 +17,9 @@ use warframe_acquisition::RewardCatalogEntry;
 
 use crate::{
     kiosk_geometry::{basket_label_rect, basket_quantity_rect},
-    reward_ocr::{best_match, ocr_crop, ocr_crop_block, prepare_crop},
+    reward_ocr::{CardReading, ocr_crop, ocr_crop_block, prepare_crop, resolve_card},
+    reward_source::CardCandidates,
 };
-
-/// Below this a slot's read is treated as absent rather than published as a guess; same floor as
-/// the reward reader.
-pub const MATCH_FLOOR: f32 = 0.6;
 
 #[derive(Clone, Debug)]
 pub struct GridCell {
@@ -51,7 +48,7 @@ fn scratch_file() -> PathBuf {
     ))
 }
 
-/// Read every grid slot independently; slots below the floor are simply not returned.
+/// Read every grid slot independently; slots below the pool's band are simply not returned.
 ///
 /// The slots share nothing but the source frame, and one tesseract spawn costs about as much
 /// as the whole crop's preprocessing, so the reads run across a small pool of threads: the
@@ -159,7 +156,7 @@ struct SlotRead {
     score: f32,
 }
 
-/// Read every slot's rect in parallel, preserving input order; failed or sub-floor reads come
+/// Read every slot's rect in parallel, preserving input order; failed or out-of-band reads come
 /// back as `None` and simply drop out of the caller's view.
 fn read_slots<T>(
     luma: &GrayImage,
@@ -266,8 +263,16 @@ fn read_slot(
     let text = ocr_crop_block(&crop);
     let _ = std::fs::remove_file(&crop);
     let text = text.ok()?;
-    let (name, score) = best_match(&text, candidates)?;
-    (score >= MATCH_FLOOR).then_some(SlotRead { name, score })
+    match resolve_card(
+        &text,
+        CardCandidates {
+            pool: candidates,
+            catalog: &[],
+        },
+    ) {
+        CardReading::Named { name, score, .. } => Some(SlotRead { name, score }),
+        CardReading::Blank | CardReading::Unknown(_) => None,
+    }
 }
 
 /// Split Warframe's optional basket stack prefix from full-charset band text. The band
@@ -466,6 +471,43 @@ mod tests {
             assert_eq!(hit.name, expected);
             assert!(hit.score >= 0.85);
         }
+    }
+
+    /// A slot whose nearest name is outside the pool band is not published as a guess, and one
+    /// inside it is. The band is the only thing between a garbled label and a wrong chip.
+    #[test]
+    fn a_slot_outside_the_pool_band_is_dropped_and_one_inside_it_is_kept() {
+        let img = image::open(FIXTURE).unwrap();
+        let far = [
+            RewardCatalogEntry {
+                name: "Kuva Bramma Blueprint".to_owned(),
+                ducats: 100,
+            },
+            RewardCatalogEntry {
+                name: "Kuva Zarr Blueprint".to_owned(),
+                ducats: 100,
+            },
+            RewardCatalogEntry {
+                name: "Peculiar Bloom".to_owned(),
+                ducats: 100,
+            },
+        ];
+        assert!(
+            read_grid(&img, &far, 0).is_empty(),
+            "a label no candidate can reach was published"
+        );
+        assert!(
+            read_basket(&img, &far).is_empty(),
+            "a label no candidate can reach was published"
+        );
+        assert!(
+            !read_grid(&img, &candidates(), 0).is_empty(),
+            "the fixture's own labels did not read"
+        );
+        assert!(
+            !read_basket(&img, &candidates()).is_empty(),
+            "the fixture's own basket did not read"
+        );
     }
 
     /// The live game basket has three occupied rows. A widened name crop crosses the pane

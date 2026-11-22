@@ -13,8 +13,14 @@ use thiserror::Error;
 
 use crate::{CatalogIndex, RelicRewardIndex};
 
+pub const RELIC_CATALOG_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+/// Version of the stored relic generation's format. A generation stamped with any other version
+/// is refetched regardless of its age, so a cache written by an older build can never be served
+/// as current after an upgrade.
+pub const RELIC_CATALOG_SCHEMA: u32 = 1;
 pub const WFCD_ALL_JSON_URL: &str = "https://api.warframestat.us/items";
-pub const WFCD_RELICS_JSON_URL: &str = "https://raw.githubusercontent.com/WFCD/warframe-items/81c893536dee6de23fbf114cf52d1b01d23bd65d/data/json/Relics.json";
+pub const WFCD_RELICS_JSON_URL: &str =
+    "https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json/Relics.json";
 // Raised from 64 MiB: the WFCD items catalog passed 64 MiB in October 2026.
 const MAX_CATALOG_BYTES: usize = 256 * 1024 * 1024;
 
@@ -84,6 +90,10 @@ impl RelicCatalogSource for WfcdRelicCatalogHttp {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogLoadSource {
     Network,
+    /// A stored generation answered without a fetch and is inside the max age. Only
+    /// [`RelicCatalogCache::load_current`] reports this; [`CatalogCache::load`] has no age check,
+    /// so every cached item catalog is [`Self::StaleCache`].
+    FreshCache,
     StaleCache,
 }
 pub struct CatalogLoad {
@@ -113,9 +123,23 @@ pub enum CatalogCacheError {
 
 #[derive(Serialize, Deserialize)]
 struct Generation {
+    /// Format version of the envelope. `serde(default)` reads a file written before the field
+    /// existed as version `0`, which no build ever wrote, so it is refetched rather than trusted.
+    #[serde(default)]
+    schema: u32,
     fetched_unix: u64,
     catalog: serde_json::Value,
     content_hash: String,
+}
+
+/// Only the retrieval time and the envelope version. Deserialising [`Generation`] builds a
+/// `serde_json::Value` of the whole relic table, which a freshness check must not pay on every
+/// launch.
+#[derive(Deserialize)]
+struct GenerationStamp {
+    #[serde(default)]
+    schema: u32,
+    fetched_unix: u64,
 }
 
 pub struct RelicCatalogLoad {
@@ -135,6 +159,10 @@ impl RelicCatalogLoad {
 
     pub const fn fetched_unix(&self) -> u64 {
         self.fetched_unix
+    }
+
+    pub const fn age_secs(&self, now_unix: u64) -> u64 {
+        now_unix.saturating_sub(self.fetched_unix)
     }
 }
 
@@ -175,7 +203,9 @@ impl CatalogCache {
     ) -> Result<(), CatalogCacheError> {
         fs::create_dir_all(&self.directory).map_err(|_| CatalogCacheError::CacheWrite)?;
         let content_hash = generation_hash(fetched_unix, &catalog)?;
+        // The item catalog validates by content hash alone and has no format version of its own.
         let bytes = serde_json::to_vec(&Generation {
+            schema: 0,
             fetched_unix,
             catalog,
             content_hash,
@@ -221,6 +251,37 @@ impl RelicCatalogCache {
         }
     }
 
+    /// Answers from the stored generation while it was written by this build's schema and is
+    /// younger than `RELIC_CATALOG_MAX_AGE_SECS`, and otherwise refetches through [`Self::load`],
+    /// which keeps answering from the stale generation if the network is unreachable.
+    pub fn load_current(
+        &self,
+        source: &dyn RelicCatalogSource,
+        now_unix: u64,
+    ) -> Result<RelicCatalogLoad, CatalogCacheError> {
+        if let Some(stamp) = self.cached_stamp()
+            && stamp.schema == RELIC_CATALOG_SCHEMA
+            && now_unix
+                .checked_sub(stamp.fetched_unix)
+                .is_some_and(|age| age < RELIC_CATALOG_MAX_AGE_SECS)
+            && let Ok(cached) = self.load_cached()
+        {
+            return Ok(RelicCatalogLoad {
+                index: cached.index,
+                source: CatalogLoadSource::FreshCache,
+                fetched_unix: cached.fetched_unix,
+            });
+        }
+        self.load(source, now_unix)
+    }
+
+    /// The stored generation's envelope version and retrieval time, read without building the
+    /// reward index so a freshness check stays cheap on a table of a few thousand relics.
+    fn cached_stamp(&self) -> Option<GenerationStamp> {
+        let bytes = fs::read(self.directory.join("relic-generation.json")).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
     pub fn load(
         &self,
         source: &dyn RelicCatalogSource,
@@ -230,8 +291,13 @@ impl RelicCatalogCache {
             if let (Ok(index), Ok(catalog)) = (
                 RelicRewardIndex::from_wfcd_json(&bytes),
                 serde_json::from_slice(&bytes),
-            ) {
-                self.store(catalog, now_unix)?;
+            ) && !index.is_empty()
+            {
+                // A failed write costs the next launch a refetch; it must not cost this session
+                // the table that was just validated.
+                if let Err(error) = self.store(catalog, now_unix) {
+                    log::warn!("relic catalog: cache write failed: {error}");
+                }
                 return Ok(RelicCatalogLoad {
                     index,
                     source: CatalogLoadSource::Network,
@@ -250,6 +316,7 @@ impl RelicCatalogCache {
         fs::create_dir_all(&self.directory).map_err(|_| CatalogCacheError::CacheWrite)?;
         let content_hash = generation_hash(fetched_unix, &catalog)?;
         let bytes = serde_json::to_vec(&Generation {
+            schema: RELIC_CATALOG_SCHEMA,
             fetched_unix,
             catalog,
             content_hash,

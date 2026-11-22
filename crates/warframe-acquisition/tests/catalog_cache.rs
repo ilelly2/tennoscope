@@ -2,15 +2,25 @@ use std::{cell::Cell, fs};
 use tempfile::tempdir;
 use warframe_acquisition::{
     CatalogCache, CatalogCacheError, CatalogFetch, CatalogLoadSource, CatalogSource,
-    RelicCatalogCache, RelicCatalogSource, WFCD_ALL_JSON_URL,
+    RELIC_CATALOG_MAX_AGE_SECS, RelicCatalogCache, RelicCatalogSource, WFCD_ALL_JSON_URL,
+    WFCD_RELICS_JSON_URL,
 };
 
 const VALID: &[u8] = br#"[{"uniqueName":"/Lotus/Powersuits/Test/Test","name":"Test Frame","type":"Warframe","category":"Warframes","masterable":true}]"#;
 const VALID_RELICS: &[u8] = br#"[{"uniqueName":"/Lotus/Types/Game/Projections/TestABronze","rewards":[{"item":{"name":"Forma Blueprint"}}]}]"#;
+const REFRESHED_RELICS: &[u8] = br#"[{"uniqueName":"/Lotus/Types/Game/Projections/T5VoidProjectionCitrineAPlatinum","rewards":[{"item":{"name":"Citrine Prime Chassis Blueprint"}}]}]"#;
 
 #[test]
 fn item_catalog_uses_the_supported_aggregate_endpoint() {
     assert_eq!(WFCD_ALL_JSON_URL, "https://api.warframestat.us/items");
+}
+
+#[test]
+fn the_relic_catalog_is_followed_from_upstream_not_a_commit() {
+    assert_eq!(
+        WFCD_RELICS_JSON_URL,
+        "https://raw.githubusercontent.com/WFCD/warframe-items/master/data/json/Relics.json"
+    );
 }
 
 struct Source {
@@ -257,4 +267,268 @@ fn fails_honestly_without_network_or_a_valid_cache() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn the_relic_catalog_fails_honestly_without_network_or_a_valid_cache() {
+    let dir = tempdir().unwrap();
+    let cache = RelicCatalogCache::new(dir.path().join("catalog"));
+    assert!(
+        cache
+            .load_current(
+                &Source {
+                    result: Err(CatalogFetch::Unavailable),
+                    calls: Cell::new(0)
+                },
+                100
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn a_relic_generation_younger_than_the_max_age_answers_without_a_fetch() {
+    let dir = tempdir().unwrap();
+    let cache = RelicCatalogCache::new(dir.path().join("catalog"));
+    cache
+        .load(
+            &Source {
+                result: Ok(VALID_RELICS.to_vec()),
+                calls: Cell::new(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    let offline = Source {
+        result: Err(CatalogFetch::Unavailable),
+        calls: Cell::new(0),
+    };
+    let loaded = cache
+        .load_current(&offline, 100 + RELIC_CATALOG_MAX_AGE_SECS - 1)
+        .unwrap();
+
+    // A young generation answered without a fetch is current, not a stale fallback: the monitor
+    // logs this source, and `StaleCache` there is a false triage signal.
+    assert_eq!(loaded.source(), CatalogLoadSource::FreshCache);
+    assert_eq!(loaded.fetched_unix(), 100);
+    assert_eq!(offline.calls.get(), 0);
+}
+
+/// A stamp ahead of the clock is not evidence of freshness. Clamping it to age zero would make
+/// one fetch under a forward-set clock look fresh forever, which is the "stale indefinitely"
+/// failure the age check exists to remove.
+#[test]
+fn a_relic_generation_stamped_past_the_current_clock_is_refetched() {
+    let dir = tempdir().unwrap();
+    let cache = RelicCatalogCache::new(dir.path().join("catalog"));
+    cache
+        .load(
+            &Source {
+                result: Ok(VALID_RELICS.to_vec()),
+                calls: Cell::new(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    let refreshed = Source {
+        result: Ok(REFRESHED_RELICS.to_vec()),
+        calls: Cell::new(0),
+    };
+    let loaded = cache.load_current(&refreshed, 50).unwrap();
+
+    assert_eq!(loaded.source(), CatalogLoadSource::Network);
+    assert_eq!(loaded.fetched_unix(), 50);
+    assert_eq!(refreshed.calls.get(), 1);
+    assert!(
+        loaded
+            .index()
+            .reward_names()
+            .any(|name| name == "Citrine Prime Chassis Blueprint")
+    );
+}
+
+#[test]
+fn a_relic_generation_written_by_an_older_schema_is_refetched_while_young() {
+    let dir = tempdir().unwrap();
+    let cache = RelicCatalogCache::new(dir.path().join("catalog"));
+    cache
+        .load(
+            &Source {
+                result: Ok(VALID_RELICS.to_vec()),
+                calls: Cell::new(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    // A build before the schema version existed wrote the same generation without the key.
+    let path = dir.path().join("catalog/relic-generation.json");
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    envelope.as_object_mut().unwrap().remove("schema");
+    fs::write(&path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
+    let refreshed = Source {
+        result: Ok(REFRESHED_RELICS.to_vec()),
+        calls: Cell::new(0),
+    };
+    let loaded = cache.load_current(&refreshed, 150).unwrap();
+
+    assert_eq!(loaded.source(), CatalogLoadSource::Network);
+    assert_eq!(loaded.fetched_unix(), 150);
+    assert_eq!(refreshed.calls.get(), 1);
+    assert!(
+        loaded
+            .index()
+            .reward_names()
+            .any(|name| name == "Citrine Prime Chassis Blueprint")
+    );
+
+    let rewritten: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        rewritten["schema"], 1,
+        "the refetch rewrites the current schema"
+    );
+    assert_eq!(rewritten["fetched_unix"], 150);
+}
+
+#[test]
+fn a_failed_cache_write_still_answers_with_the_fetched_table() {
+    let dir = tempdir().unwrap();
+    // A file where the cache directory should be makes every store attempt fail, which is what a
+    // full disk or a read-only app-data directory does.
+    let blocked = dir.path().join("catalog");
+    fs::write(&blocked, b"").unwrap();
+    let cache = RelicCatalogCache::new(&blocked);
+
+    let loaded = cache
+        .load(
+            &Source {
+                result: Ok(VALID_RELICS.to_vec()),
+                calls: Cell::new(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    assert_eq!(loaded.source(), CatalogLoadSource::Network);
+    assert_eq!(loaded.fetched_unix(), 100);
+    assert!(
+        loaded
+            .index()
+            .reward_names()
+            .any(|name| name == "Forma Blueprint")
+    );
+    assert!(!dir.path().join("catalog").is_dir());
+}
+
+#[test]
+fn an_expired_relic_generation_is_refetched() {
+    let dir = tempdir().unwrap();
+    let cache = RelicCatalogCache::new(dir.path().join("catalog"));
+    cache
+        .load(
+            &Source {
+                result: Ok(VALID_RELICS.to_vec()),
+                calls: Cell::new(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    let now = 100 + RELIC_CATALOG_MAX_AGE_SECS;
+    let refreshed = Source {
+        result: Ok(br#"[{"uniqueName":"/Lotus/Types/Game/Projections/T5VoidProjectionCitrineAPlatinum","rewards":[{"item":{"name":"Citrine Prime Chassis Blueprint"}}]}]"#.to_vec()),
+        calls: Cell::new(0),
+    };
+    let loaded = cache.load_current(&refreshed, now).unwrap();
+
+    assert_eq!(loaded.source(), CatalogLoadSource::Network);
+    assert_eq!(loaded.fetched_unix(), now);
+    assert_eq!(refreshed.calls.get(), 1);
+    assert!(
+        loaded
+            .index()
+            .reward_names()
+            .any(|name| name == "Citrine Prime Chassis Blueprint")
+    );
+}
+
+#[test]
+fn an_expired_generation_still_answers_when_the_refetch_fails() {
+    let dir = tempdir().unwrap();
+    let cache = RelicCatalogCache::new(dir.path().join("catalog"));
+    cache
+        .load(
+            &Source {
+                result: Ok(VALID_RELICS.to_vec()),
+                calls: Cell::new(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    let loaded = cache
+        .load_current(
+            &Source {
+                result: Err(CatalogFetch::Unavailable),
+                calls: Cell::new(0),
+            },
+            100 + RELIC_CATALOG_MAX_AGE_SECS,
+        )
+        .unwrap();
+
+    assert_eq!(loaded.source(), CatalogLoadSource::StaleCache);
+    assert_eq!(loaded.fetched_unix(), 100);
+    assert!(
+        loaded
+            .index()
+            .reward_names()
+            .any(|name| name == "Forma Blueprint")
+    );
+}
+
+#[test]
+fn a_relic_payload_with_no_rewards_never_replaces_a_complete_generation() {
+    let dir = tempdir().unwrap();
+    let cache = RelicCatalogCache::new(dir.path().join("catalog"));
+    cache
+        .load(
+            &Source {
+                result: Ok(VALID_RELICS.to_vec()),
+                calls: Cell::new(0),
+            },
+            100,
+        )
+        .unwrap();
+
+    let loaded = cache
+        .load_current(
+            &Source {
+                result: Ok(
+                    br#"[{"uniqueName":"/Lotus/Types/Game/Projections/TestABronze","rewards":[]}]"#
+                        .to_vec(),
+                ),
+                calls: Cell::new(0),
+            },
+            100 + RELIC_CATALOG_MAX_AGE_SECS,
+        )
+        .unwrap();
+
+    assert_eq!(loaded.source(), CatalogLoadSource::StaleCache);
+    assert_eq!(loaded.fetched_unix(), 100);
+    assert!(
+        loaded
+            .index()
+            .reward_names()
+            .any(|name| name == "Forma Blueprint")
+    );
+
+    let envelope: serde_json::Value = serde_json::from_slice(
+        &fs::read(dir.path().join("catalog/relic-generation.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(envelope["fetched_unix"], 100);
 }
