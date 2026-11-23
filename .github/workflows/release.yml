@@ -91,6 +91,12 @@ jobs:
           # from workspace version 0.5.4 -- so compare the part before the first `-`.
           tag=${GITHUB_REF_NAME#v}
           tag=${tag%%-*}
+          # ilelly2 fork: release tags end in `f` (`v0.14.1f`, `v0.15.0f-rc1`) so they can never be
+          # mistaken for upstream's. A tag without it is refused rather than built.
+          case "$tag" in
+            *f) tag=${tag%f} ;;
+            *) echo "fork release tags end in f (v${tag}f); refusing $GITHUB_REF_NAME" >&2; exit 1 ;;
+          esac
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
           if [ "$tag" != "$version" ]; then
             echo "tag $GITHUB_REF_NAME does not name workspace version $version" >&2

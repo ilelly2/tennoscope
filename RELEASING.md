@@ -71,6 +71,10 @@ document: substitute the version you are cutting.
 
 4. **Commit and tag.**
 
+   > **ilelly2 fork:** release tags end in `f` — `vX.Y.Zf`, or `vX.Y.Zf-rc1` for a beta — so they
+   > are never confused with upstream's `vX.Y.Z`. The version inside the repository stays plain
+   > `X.Y.Z`, and the release workflow refuses any tag without the `f`.
+
    ```bash
    git commit -am "chore(release): prepare vX.Y.Z"
    git tag -a vX.Y.Z -m "vX.Y.Z"
