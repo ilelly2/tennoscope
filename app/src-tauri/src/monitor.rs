@@ -3,7 +3,7 @@ use super::{
     kiosk_ocr::{self, BasketRow, GridCell},
     kiosk_scroll,
     kiosk_view::{self, KioskState, KioskView, MasteryStatus},
-    overlay_window, refresh_blocking, reward_capture,
+    overlay_window, publish_reward_overlay_visibility, refresh_blocking, reward_capture,
     reward_log::{RewardLogEvent, RewardLogMachine},
     reward_observer::{RewardObservation, RewardObserverState},
     reward_ocr::{self, ScreenRewardSource},
@@ -32,7 +32,18 @@ use warframe_acquisition::{
     MemoryReader, PriceTable, ProcessDiscovery, RelicCatalogCache, RelicRewardIndex,
     RewardCatalogEntry, RewardMemoryScanner, WarmOutcome, WfcdCatalogHttp, WfcdRelicCatalogHttp,
 };
+use warframe_acquisition::{CatalogFetch, RelicCatalogSource};
 use warframe_domain::RewardCandidate;
+
+/// The live relic table source. It builds the HTTP client once per fetch so a failed client
+/// build leaves the table in place instead of clearing it.
+struct LiveRelicCatalogSource;
+
+impl RelicCatalogSource for LiveRelicCatalogSource {
+    fn fetch(&self) -> Result<Vec<u8>, CatalogFetch> {
+        WfcdRelicCatalogHttp::new()?.fetch()
+    }
+}
 
 /// Upper bound on how long a single fissure mission is worth watching for.
 /// Shared with the kiosk poller; reward recognition owns its own search/watch cadence.
@@ -834,6 +845,45 @@ impl RecordScans {
 struct EventScope<'a> {
     policy: AccessPolicy,
     generation: &'a MonitorGeneration,
+    /// The current wall clock, so a handler that ages the relic table does not have to read it
+    /// again.
+    now_unix: u64,
+}
+
+/// What the overlay should do with one drained recognition update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Visibility {
+    /// Show the strip for this many cards.
+    Draw(usize),
+    Hide,
+}
+
+/// Decide the overlay's next visibility from one recognition update.
+///
+/// Pure on purpose: the three inputs mean different things and conflating them is what made a
+/// live screen disappear. `cards` is a set that resolved. `unreadable` says this look failed but
+/// the screen may still be up. `failure` is a diagnosis with no visibility consequence.
+///
+/// Show only on the observer's rising edge. The observer already requires one hit, so keying off
+/// its `publish` flag would repaint on every capture; `show` fires once per appearance.
+fn plan_presentation(
+    cards: Option<&[RewardObservation]>,
+    unreadable: bool,
+    failure: bool,
+    observer: &mut RewardObserverState,
+) -> Option<Visibility> {
+    if let Some(cards) = cards {
+        let transition = observer.observe(cards.to_vec());
+        return transition.show.then_some(Visibility::Draw(cards.len()));
+    }
+    if unreadable {
+        let transition = observer.miss();
+        return transition.hide.then_some(Visibility::Hide);
+    }
+    // A failure with no cards and no unreadable look is a diagnosis only: the observer keeps
+    // whatever it believed, so a capture problem cannot blank a live strip.
+    let _ = failure;
+    None
 }
 
 /// Everything whose lifetime is one monitored Warframe process's reward stream.
@@ -852,6 +902,11 @@ struct RewardSession {
     /// mark health degraded every poll while broken capture still reports immediately.
     degraded_reason: Option<String>,
     degraded_streak: u32,
+    /// Where the relic table is cached, so a session that outlives the table's age can fetch a
+    /// newer one instead of matching against a table that predates the relics the squad picked.
+    app_data: Option<PathBuf>,
+    /// When the table in use was fetched. A baseline after this moment refreshes the table.
+    relic_table_fetched_unix: u64,
 }
 
 impl RewardSession {
@@ -860,6 +915,8 @@ impl RewardSession {
         relics: Option<RelicRewardIndex>,
         rewards: Vec<RewardCatalogEntry>,
         price_cache: MarketPriceCache,
+        app_data: Option<PathBuf>,
+        relic_table_fetched_unix: u64,
     ) -> Self {
         Self {
             recognition: RewardRecognition::new(
@@ -879,7 +936,62 @@ impl RewardSession {
             price_cache,
             degraded_reason: None,
             degraded_streak: 0,
+            app_data,
+            relic_table_fetched_unix,
         }
+    }
+
+    /// Fetch a newer relic table when the one in use has aged out.
+    ///
+    /// The table is loaded once when the monitor starts, so a session that runs for hours keeps
+    /// matching against the table that was current then. The reload happens on a baseline rather
+    /// than on a timer: a baseline is the moment the squad's relics are known, and a table
+    /// fetched any other time would not be used until the next one anyway.
+    ///
+    /// A failed fetch leaves the table in place. The stale table still names the rewards the
+    /// squad can drop, and the reader refuses to name a card it cannot constrain.
+    fn refresh_relic_table_if_stale_with(
+        &mut self,
+        now_unix: u64,
+        source: &dyn warframe_acquisition::RelicCatalogSource,
+    ) {
+        let Some(app_data) = self.app_data.clone() else {
+            return;
+        };
+        let age = now_unix.saturating_sub(self.relic_table_fetched_unix);
+        if age < warframe_acquisition::RELIC_CATALOG_MAX_AGE_SECS {
+            return;
+        }
+        let Some(loaded) = RelicCatalogCache::new(app_data.join("catalog"))
+            .load_current(source, now_unix)
+            .ok()
+        else {
+            return;
+        };
+        log::info!(
+            "relic catalog: reloaded mid-session source={:?} fetched={} relics={}",
+            loaded.source(),
+            loaded.fetched_unix(),
+            loaded.index().relic_count(),
+        );
+        self.recognition.replace_relic_table(loaded.index().clone());
+        self.relic_table_fetched_unix = loaded.fetched_unix();
+    }
+
+    /// The baseline's first steps: bring the relic table up to date, then hand the baseline to
+    /// the reader so its pool comes from the newest table available.
+    ///
+    /// The reload happens here and not on a timer because a baseline is the moment the squad's
+    /// relics are known. A table fetched any other time would not be used until the next one
+    /// anyway.
+    fn take_baseline(
+        &mut self,
+        event: &RewardLogEvent,
+        now_unix: u64,
+        source: &dyn warframe_acquisition::RelicCatalogSource,
+    ) {
+        self.refresh_relic_table_if_stale_with(now_unix, source);
+        self.recognition.observe(event);
     }
 
     fn handle_event(
@@ -921,7 +1033,9 @@ impl RewardSession {
                     self.recognition.close();
                     return;
                 };
-                self.recognition.observe(&event);
+                // A table that has aged out cannot name the relics the squad just loaded, so
+                // fetch a newer one before the pool is derived from it.
+                self.take_baseline(&event, scope.now_unix, &LiveRelicCatalogSource);
                 // Keep the dormant responder-scan candidates in step with recognition.
                 // Recognition owns the catalog derivation; memory only mirrors it.
                 let candidates = self.recognition.candidates();
@@ -973,47 +1087,68 @@ impl RewardSession {
         app: &AppHandle,
         now: u64,
         generation: &MonitorGeneration,
-    ) {
-        let publication = recognized.publication.clone();
+    ) -> Option<Vec<RewardObservation>> {
+        let publication = recognized.publication;
         let cards = recognized.cards;
         let elapsed = recognized.elapsed;
         // Only the first publication for this epoch runs; late duplicates and stale
         // delayed effects are declined by the same gate.
-        publication.publish(|| {
-            let transition = self.observer.observe(cards);
-            let mut overlay_notice = None;
-            if transition.publish {
-                apply_reward_observations(
-                    shared,
-                    self.recognition.rewards(),
-                    &transition.choices,
-                    &BTreeMap::new(),
-                );
-                overlay_notice = overlay_window::show_reward_overlay(app, transition.choices.len());
-                let _ = app.emit_to("reward-overlay", "reward-updated", ());
-                spawn_market_price_fetch(
-                    &transition.choices,
-                    shared,
-                    app,
-                    self.recognition.rewards(),
-                    &self.price_cache,
-                    now,
-                    generation,
-                );
-            }
+        let ran = publication.publish(|| {
+            apply_reward_observations(shared, self.recognition.rewards(), &cards, &BTreeMap::new());
+            let _ = app.emit_to("reward-overlay", "reward-updated", ());
+            spawn_market_price_fetch(
+                &cards,
+                shared,
+                app,
+                self.recognition.rewards(),
+                &self.price_cache,
+                now,
+                generation,
+            );
             if let Ok(mut runtime) = shared.lock() {
                 let _ = runtime.core.record_capture_source_ready(
                     "ocr",
                     elapsed.as_millis(),
                     now.to_string(),
                 );
+            }
+        });
+        ran.then_some(cards)
+    }
+
+    /// The overlay's single visibility writer.
+    ///
+    /// `cards` is what actually published this tick, so a delivery the gate declined cannot
+    /// show a strip. `unreadable` says the look failed but the screen may still be up.
+    fn present(
+        &mut self,
+        shared: &SharedRuntime,
+        app: &AppHandle,
+        cards: Option<&[RewardObservation]>,
+        unreadable: bool,
+        failure: bool,
+    ) {
+        match plan_presentation(cards, unreadable, failure, &mut self.observer) {
+            Some(Visibility::Draw(count)) => {
+                let notice = overlay_window::show_reward_overlay(app, count);
+                publish_reward_overlay_visibility(app, true, count);
                 // Read the cards but could not find the window to draw over: on Windows that is
                 // exclusive fullscreen, and the player is the only one who can fix it.
-                if let Some(notice) = overlay_notice {
+                if let Some(notice) = notice
+                    && let Ok(mut runtime) = shared.lock()
+                {
                     let _ = runtime.core.record_capture_degraded(notice);
                 }
             }
-        });
+            Some(Visibility::Hide) => self.hide_overlay(app),
+            None => {}
+        }
+    }
+
+    /// Take the strip down and tell the frontend. Sole caller of the window hide.
+    fn hide_overlay(&mut self, app: &AppHandle) {
+        overlay_window::hide_reward_overlay(app);
+        publish_reward_overlay_visibility(app, false, 0);
     }
 
     fn drain_recognition(
@@ -1027,9 +1162,14 @@ impl RewardSession {
         // A slow capture therefore cannot delay overlay hide, game-gone or the next event.
         let update = self.recognition.poll();
         let had_recognized = update.recognized.is_some();
-        if let Some(recognized) = update.recognized {
-            self.publish(recognized, shared, app, now, generation);
-        }
+        let unreadable = update.unreadable;
+        let failure = update.failure.is_some();
+        // Only cards the gate actually published may drive a show: a delivery it declined is
+        // not what the overlay should display.
+        let published = update
+            .recognized
+            .and_then(|recognized| self.publish(recognized, shared, app, now, generation));
+        self.present(shared, app, published.as_deref(), unreadable, failure);
         if let Some(failure) = update.failure {
             let (reason, streak) = if self.degraded_reason.as_deref() == Some(&failure.reason) {
                 self.degraded_streak = self.degraded_streak.saturating_add(1);
@@ -1057,12 +1197,10 @@ impl RewardSession {
             self.degraded_streak = 0;
         }
         // The capture signal beats EE.log's delayed shutdown line and prevents a stale overlay.
-        if update.hide && self.observer.miss().hide {
-            overlay_window::hide_reward_overlay(app);
-        }
+        // Visibility already went through `present`; nothing else may write it.
     }
 
-    fn game_gone(&mut self, hide: &dyn Fn()) {
+    fn game_gone(&mut self, app: &AppHandle) {
         // Suspend without clearing the pool: a transient process-absent tick must not blind the
         // fissure, since relic baselines are one-shot log lines with no recovery path. The worker
         // drops its source and pauses; recognition resumes against the preserved pool when the
@@ -1071,7 +1209,7 @@ impl RewardSession {
         self.memory.clear();
         self.scans.reset();
         if self.observer.miss().hide {
-            hide();
+            self.hide_overlay(app);
         }
     }
 
@@ -1088,7 +1226,7 @@ impl RewardSession {
         // first routine blank could hit the warning threshold on the previous screen's count.
         self.degraded_reason = None;
         self.degraded_streak = 0;
-        overlay_window::hide_reward_overlay(app);
+        self.hide_overlay(app);
         if let Ok(mut runtime) = shared.lock() {
             let _ = runtime.core.apply_reward_candidates(Vec::new());
         }
@@ -1299,12 +1437,16 @@ pub(crate) fn run(
         );
         poller
     };
-    let relic_catalog = shared
-        .lock()
-        .ok()
-        .and_then(|runtime| load_relic_catalog(&runtime.app_data));
-    let mut reward_session =
-        RewardSession::new(catalog, relic_catalog, reward_catalog, price_cache.clone());
+    let app_data = shared.lock().ok().map(|runtime| runtime.app_data.clone());
+    let relic_catalog = app_data.as_deref().and_then(load_relic_catalog);
+    let mut reward_session = RewardSession::new(
+        catalog,
+        relic_catalog.as_ref().map(|(relics, _)| relics.clone()),
+        reward_catalog,
+        price_cache.clone(),
+        app_data,
+        relic_catalog.as_ref().map_or(0, |(_, fetched)| *fetched),
+    );
     // EE.log reaches us seconds after the events it describes (measured at ~7.5s on 2026-07-27),
     // by which time the fifteen-second reward screen can already be gone. The relic-load signal
     // arrives minutes ahead of the screen though, so it can arm a poller that watches for the cards
@@ -1435,6 +1577,7 @@ pub(crate) fn run(
                     EventScope {
                         policy,
                         generation: &generation,
+                        now_unix: now,
                     },
                 );
             }
@@ -1462,7 +1605,7 @@ pub(crate) fn run(
         }
         reward_session.drain_recognition(&shared, &app, now, &generation);
         if process.is_none() {
-            reward_session.game_gone(&|| overlay_window::hide_reward_overlay(&app));
+            reward_session.game_gone(&app);
             // No game, no kiosk: the capture source is gone even if the miss streak has not
             // finished counting.
             if let Some(kiosk_view_cell) = app.try_state::<KioskState>() {
@@ -1519,17 +1662,28 @@ fn load_catalog(app_data: &Path) -> Option<CatalogIndex> {
         .map(|catalog| catalog.index().clone())
 }
 
-fn load_relic_catalog(app_data: &Path) -> Option<RelicRewardIndex> {
-    let cache = RelicCatalogCache::new(app_data.join("catalog"));
-    if let Ok(catalog) = cache.load_cached() {
-        return Some(catalog.index().clone());
-    }
-    let source = WfcdRelicCatalogHttp::new().ok()?;
+fn load_relic_catalog(app_data: &Path) -> Option<(RelicRewardIndex, u64)> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    cache
-        .load(&source, now)
-        .ok()
-        .map(|catalog| catalog.index().clone())
+    let source = WfcdRelicCatalogHttp::new().ok()?;
+    load_relic_catalog_with(app_data, &source, now)
+}
+
+fn load_relic_catalog_with(
+    app_data: &Path,
+    source: &dyn warframe_acquisition::RelicCatalogSource,
+    now_unix: u64,
+) -> Option<(RelicRewardIndex, u64)> {
+    let cache = RelicCatalogCache::new(app_data.join("catalog"));
+    let loaded = cache.load_current(source, now_unix).ok()?;
+    log::info!(
+        "relic catalog: source={:?} fetched={} age_s={} relics={} reward_rows={}",
+        loaded.source(),
+        loaded.fetched_unix(),
+        loaded.age_secs(now_unix),
+        loaded.index().relic_count(),
+        loaded.index().reward_names().count(),
+    );
+    Some((loaded.index().clone(), loaded.fetched_unix()))
 }
 
 /// How often the kiosk poller looks, and how long it may run.
@@ -4859,6 +5013,193 @@ mod tests {
         assert!(
             off.cells.is_empty(),
             "a player who turned marks off is not told the data is missing"
+        );
+    }
+
+    struct CountingRelicSource {
+        payload: Result<Vec<u8>, warframe_acquisition::CatalogFetch>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl warframe_acquisition::RelicCatalogSource for CountingRelicSource {
+        fn fetch(&self) -> Result<Vec<u8>, warframe_acquisition::CatalogFetch> {
+            self.calls.set(self.calls.get() + 1);
+            self.payload.clone()
+        }
+    }
+
+    const PINNED_RELICS: &[u8] = br#"[{"uniqueName":"/Lotus/Types/Game/Projections/TestABronze","rewards":[{"item":{"name":"Forma Blueprint"}}]}]"#;
+    const CITRINE_RELICS: &[u8] = br#"[{"uniqueName":"/Lotus/Types/Game/Projections/T5VoidProjectionCitrineAPlatinum","rewards":[{"item":{"name":"Citrine Prime Chassis Blueprint"}}]}]"#;
+
+    #[test]
+    fn the_monitor_refreshes_an_expired_relic_generation_instead_of_trusting_it() {
+        let directory = tempfile::tempdir().expect("temporary runtime");
+        let app_data = directory.path();
+        let seeded = CountingRelicSource {
+            payload: Ok(PINNED_RELICS.to_vec()),
+            calls: std::cell::Cell::new(0),
+        };
+        RelicCatalogCache::new(app_data.join("catalog"))
+            .load(&seeded, 100)
+            .expect("the expired generation is seeded");
+
+        let expired_at = 100 + warframe_acquisition::RELIC_CATALOG_MAX_AGE_SECS;
+        let refreshed = CountingRelicSource {
+            payload: Ok(CITRINE_RELICS.to_vec()),
+            calls: std::cell::Cell::new(0),
+        };
+        let (index, fetched) = load_relic_catalog_with(app_data, &refreshed, expired_at)
+            .expect("an expired generation is refreshed");
+        assert!(
+            index
+                .reward_names()
+                .any(|name| name == "Citrine Prime Chassis Blueprint"),
+            "the monitor served the stale generation instead of refetching"
+        );
+        assert_eq!(fetched, expired_at, "the fetch time travels with the table");
+        assert_eq!(refreshed.calls.get(), 1, "exactly one refetch");
+
+        let fresh = CountingRelicSource {
+            payload: Ok(PINNED_RELICS.to_vec()),
+            calls: std::cell::Cell::new(0),
+        };
+        // The refetch stored its generation at `expired_at`, so freshness is measured from
+        // there. Reading the clock before that instant would ask about a cache written in the
+        // future, which is correctly not fresh -- and would refetch for the wrong reason.
+        let (cached, cached_at) = load_relic_catalog_with(app_data, &fresh, expired_at + 1)
+            .expect("a current generation answers from the cache");
+        assert!(
+            cached
+                .reward_names()
+                .any(|name| name == "Citrine Prime Chassis Blueprint"),
+            "the fresh generation is the one just stored"
+        );
+        assert_eq!(
+            cached_at, expired_at,
+            "a cached table carries the time it was fetched, not the time it was read"
+        );
+        assert_eq!(fresh.calls.get(), 0, "a fresh generation costs no fetch");
+    }
+
+    /// A session that outlives the relic table's age must swap the table it matches against,
+    /// not keep the one that was current when it started. The swap reaches the reader: a relic
+    /// the old table never heard of becomes known to it, and its reward becomes nameable from
+    /// the catalogue the swap rebuilt.
+    #[test]
+    fn a_baseline_brings_an_aged_table_and_its_reward_catalogue_to_the_reader() {
+        const NEW_RELIC: &str = "/Lotus/Types/Game/Projections/T5VoidProjectionCitrineAPlatinum";
+        const NEW_REWARD: &str = "Citrine Prime Chassis Blueprint";
+
+        let directory = tempfile::tempdir().expect("temporary runtime");
+        let app_data = directory.path();
+        let seeded = CountingRelicSource {
+            payload: Ok(PINNED_RELICS.to_vec()),
+            calls: std::cell::Cell::new(0),
+        };
+        let loaded = RelicCatalogCache::new(app_data.join("catalog"))
+            .load(&seeded, 100)
+            .expect("the generation is seeded");
+        let stale_index = loaded.index().clone();
+        let fetched_at = loaded.fetched_unix();
+
+        let mut session = RewardSession::new(
+            None,
+            Some(stale_index),
+            Vec::new(),
+            MarketPriceCache::new(),
+            Some(app_data.to_path_buf()),
+            fetched_at,
+        );
+        assert!(
+            !session.recognition.knows_relic(NEW_RELIC),
+            "the stale table does not know the new relic"
+        );
+        {
+            let (pool, catalogue) = session.recognition.matching_candidates();
+            assert!(pool.is_empty(), "no catalog, so no pool to match against");
+            assert!(
+                !catalogue.iter().any(|entry| entry.name == NEW_REWARD),
+                "the stale catalogue must not know the new reward, or this tests nothing"
+            );
+        }
+
+        let expired_at = fetched_at + warframe_acquisition::RELIC_CATALOG_MAX_AGE_SECS;
+        let refreshed = CountingRelicSource {
+            payload: Ok(CITRINE_RELICS.to_vec()),
+            calls: std::cell::Cell::new(0),
+        };
+        session.take_baseline(
+            &RewardLogEvent::BaselineRequested {
+                relic_paths: vec![NEW_RELIC.to_owned()],
+            },
+            expired_at,
+            &refreshed,
+        );
+
+        assert_eq!(
+            refreshed.calls.get(),
+            1,
+            "the expired table costs one fetch"
+        );
+        assert!(
+            session.recognition.knows_relic(NEW_RELIC),
+            "the reader kept the table it started with instead of the one just fetched"
+        );
+        assert_eq!(
+            session.relic_table_fetched_unix, expired_at,
+            "the fetch time travels with the table"
+        );
+        let (pool, catalogue) = session.recognition.matching_candidates();
+        assert!(
+            matches!(
+                crate::reward_ocr::resolve_card(
+                    NEW_REWARD,
+                    crate::reward_source::CardCandidates {
+                        pool: &pool,
+                        catalog: &catalogue,
+                    },
+                ),
+                crate::reward_ocr::CardReading::Named { .. }
+            ),
+            "the reader must name the reward the new table brought"
+        );
+    }
+
+    /// The overlay's visibility is decided in one place, and the three inputs must not blur
+    /// together: a diagnosis with no cards may not blank a live strip, an unreadable look hides
+    /// only after its own miss streak, and a re-read of the same cards must not repaint.
+    #[test]
+    fn an_unreadable_read_hides_without_forgetting_the_screen() {
+        let cards = vec![
+            RewardObservation::certain("Perigale Prime Receiver"),
+            RewardObservation::certain("Vasto Prime Stock"),
+        ];
+        let mut observer = RewardObserverState::new(1, 1);
+
+        assert_eq!(
+            plan_presentation(Some(&cards), false, false, &mut observer),
+            Some(Visibility::Draw(2)),
+            "the first resolved read draws the strip at its own width"
+        );
+        assert_eq!(
+            plan_presentation(Some(&cards), false, false, &mut observer),
+            None,
+            "the same cards read again must not repaint"
+        );
+        assert_eq!(
+            plan_presentation(None, false, true, &mut observer),
+            None,
+            "a diagnosis with no cards may not take down a live strip"
+        );
+        assert_eq!(
+            plan_presentation(None, true, false, &mut observer),
+            Some(Visibility::Hide),
+            "an unreadable look hides once its streak is met"
+        );
+        assert_eq!(
+            plan_presentation(Some(&cards), false, false, &mut observer),
+            Some(Visibility::Draw(2)),
+            "a recovered read draws again rather than staying hidden"
         );
     }
 }

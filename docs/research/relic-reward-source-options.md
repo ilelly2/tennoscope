@@ -66,6 +66,17 @@ This means TennoScope's OCR “data” should be:
 - per-relic candidate mappings from WFCD `Relics.json`;
 - fuzzy-match thresholds and regression screenshots.
 
+### Freshness of the relic reward table (2026-11-20)
+
+The relic table is fetched from the upstream `master` branch of `data/json/Relics.json`, not a pinned commit, and a cached copy is refetched once it is a day old. The pin was the defect: it froze the table at 2026-07-24, so a squad carrying a newer relic resolved to no rewards and the matcher was forced onto a neighbouring name. Each stored generation records the schema version that wrote it, and a cache written by a build with a different schema version is refetched regardless of its age, so the first launch after an upgrade replaces it without any migration step.
+
+Two alternatives were measured and rejected:
+
+- The aggregate items endpoint (`https://api.warframestat.us/items`) cannot stand in for `Relics.json`. Every one of its 3208 projection records carries an empty `rewards` array, so deriving the reward table from it yields no candidates and therefore no overlay. A payload shaped that way is refused rather than stored, which keeps a wrong source from replacing a good cache.
+- `https://drops.warframestat.us/data/relics.json` agrees with `Relics.json` wherever the two share a relic, so it carries no corrective information, and its records have no `/Lotus/` path to join on. It is a possible fallback, not a primary.
+
+A table that is a day stale is still a table that can be wrong; the matcher therefore reports a card it cannot confidently place instead of naming the nearest neighbour.
+
 ## Item/reward metadata and images
 
 WFCD's `warframe-items` repository is the primary catalog used by the reviewed tools. Its README states that each item's image filename is in `item.imageName`, the image files live under `data/img`, and the hosted form is `https://cdn.warframestat.us/img/${item.imageName}`. See [WFCD image documentation](https://github.com/WFCD/warframe-items/blob/81c893536dee6de23fbf114cf52d1b01d23bd65d/README.md#L100-L110).

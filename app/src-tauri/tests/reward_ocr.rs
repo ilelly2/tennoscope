@@ -1,4 +1,4 @@
-use app_lib::{CardCandidates, best_card_match, best_match};
+use app_lib::{CardCandidates, best_card_match};
 use warframe_acquisition::RewardCatalogEntry;
 
 mod common;
@@ -59,7 +59,8 @@ fn garbled_card_reads_still_land_on_the_right_reward() {
         ("Burston Prime Stock", "Burston Prime Stock"),
         ("Trumna Prime Blueprint", "Trumna Prime Blueprint"),
     ] {
-        let (name, score) = best_match(read, &pool).expect("a candidate always scores");
+        let (name, score) =
+            best_card_match(read, pool_only(&pool)).expect("a candidate always scores");
         assert_eq!(name, expected, "read {read:?}");
         assert!(score >= 0.6, "read {read:?} scored only {score}");
     }
@@ -75,22 +76,23 @@ fn near_identical_rewards_stay_separable() {
         ("Burston Prime Receiver", "Burston Prime Receiver"),
         ("Trumna Prime Barrel", "Trumna Prime Barrel"),
     ] {
-        let (name, _) = best_match(read, &pool).expect("a candidate always scores");
+        let (name, _) = best_card_match(read, pool_only(&pool)).expect("a candidate always scores");
         assert_eq!(name, expected, "read {read:?}");
     }
 }
 
 #[test]
 fn an_empty_or_unreadable_card_matches_nothing() {
-    assert!(best_match("", &pool()).is_none());
-    assert!(best_match("   \n", &pool()).is_none());
+    assert!(best_card_match("", pool_only(&pool())).is_none());
+    assert!(best_card_match("   \n", pool_only(&pool())).is_none());
 }
 
 /// A card that is not in the pool at all must score below the publish floor rather than snapping
 /// to the nearest name, so a bad capture fails closed instead of showing a plausible wrong reward.
 #[test]
 fn text_from_outside_the_pool_scores_below_the_floor() {
-    let (_, score) = best_match("Orokin Catalyst Blueprint", &pool()).expect("scores");
+    let (_, score) =
+        best_card_match("Orokin Catalyst Blueprint", pool_only(&pool())).expect("scores");
     assert!(score < 0.6, "unrelated text scored {score}");
 }
 
@@ -156,7 +158,9 @@ fn a_fuzzy_read_never_names_a_reward_outside_the_pool() {
     let read = "Burston Prime\n\nBlue";
     // Otherwise the catalogue would merely agree with the pool and this would test nothing.
     assert_eq!(
-        best_match(read, &catalog).map(|(name, _)| name).as_deref(),
+        best_card_match(read, pool_only(&catalog))
+            .map(|(name, _)| name)
+            .as_deref(),
         Some("Burston Prime Barrel"),
     );
     let (name, _) = best_card_match(
@@ -447,7 +451,8 @@ fn an_ornament_above_the_title_does_not_swallow_the_read() {
     let crop = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/reward-crop-ornament.png");
     let text = app_lib::ocr_crop(&crop).expect("tesseract is not available");
-    let (name, score) = best_match(&text, &live_pool()).expect("a candidate always scores");
+    let (name, score) =
+        best_card_match(&text, pool_only(&live_pool())).expect("a candidate always scores");
     assert_eq!(name, "Dual Zoren Prime Handle", "read {text:?}");
     assert!(score >= 0.95, "read {text:?} scored only {score}");
 }

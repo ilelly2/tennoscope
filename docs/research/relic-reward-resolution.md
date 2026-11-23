@@ -253,9 +253,13 @@ The pool is now a shared cell the poller re-reads every poll, and every baseline
 rather than only the first. `a_relic_that_loads_after_the_baseline_still_grows_the_pool` in
 `app/src-tauri/tests/reward_recognition.rs` covers it, and fails against the old capture-by-value.
 
-Still open: a single unrecognised card still discards the other three. That is correct when the read
-is garbage, and wrong when it is one genuinely unknown reward: a new prime the catalog has not
-caught up with would silently cost the whole overlay.
+One unrecognised card still discards the other three, and that stays deliberate. The publication
+gate refuses a set whose size differs from the logged choice count, so a three-of-four read could
+not publish even if the reader handed it over: the trade is between no overlay and an overlay that
+is silently missing a reward. What the old note called the wrong half of that trade, a reward newer
+than the table, is now bounded. The table follows upstream `master` and is refetched once it is a
+day old, on launch or on the next baseline, so a part upstream has published is picked up at the
+next refetch rather than at the next release.
 
 ### What the layer-shell path was skipping
 

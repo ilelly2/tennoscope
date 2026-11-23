@@ -19,7 +19,7 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
@@ -86,6 +86,9 @@ pub(crate) fn poll_failure_is_worth_warning(reason: &str, consecutive: u32) -> b
 pub struct RecognitionUpdate {
     pub recognized: Option<RecognizedRewards>,
     pub hide: bool,
+    /// The screen could not be read this look, so the last published view is stale but the
+    /// screen may still be up. Distinct from `hide`, which says the screen is gone.
+    pub unreadable: bool,
     pub failure: Option<FailureTrace>,
 }
 
@@ -172,6 +175,7 @@ where
             revision: 1,
         }));
         let delivery = Arc::new(Mutex::new(None));
+        let published_cards = Arc::new(Mutex::new(None));
         let wake = Arc::new((Mutex::new(WakeState::default()), Condvar::new()));
         let epoch = Arc::new(AtomicU64::new(0));
         let revision = Arc::new(AtomicU64::new(1));
@@ -185,9 +189,9 @@ where
         let card_catalogue = card_catalogue(&rewards, relics.as_ref());
         let shared = Arc::new(Shared {
             catalog,
-            relics,
+            relics: RwLock::new(relics),
             rewards,
-            card_catalogue,
+            card_catalogue: RwLock::new(card_catalogue),
             timing,
             epoch: epoch.clone(),
             revision: revision.clone(),
@@ -195,6 +199,7 @@ where
             constraint,
             pool,
             delivery,
+            published_cards,
             wake,
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(false),
@@ -268,10 +273,24 @@ where
         }
         let candidates = derive_candidates(shared, relic_paths);
         let entries = pool_entries(&candidates, &shared.rewards);
+        let all_relics_known = shared
+            .relics
+            .read()
+            .ok()
+            .and_then(|relics| {
+                relics.as_ref().map(|relics| {
+                    relics.known_projection_path_count(relic_paths) == relic_paths.len()
+                })
+            })
+            // No table at all means no path is known: the catalogue has nothing to be
+            // constrained against, so the reader must wait for a table rather than capture
+            // against every reward in the game.
+            .unwrap_or(false);
         let mut guard = lock(&shared.pool);
         guard.relics = relic_paths.to_vec();
         guard.candidates = candidates;
         guard.entries = entries;
+        guard.all_relics_known = all_relics_known;
         drop(guard);
         // A new pool retires in-flight captures: a read matched against the old pool must not
         // publish under the new one. Baselines arrive minutes before the screen, not after
@@ -333,6 +352,7 @@ where
         }
         // Drop any pending delivery; nothing captured under the retired epoch is usable.
         *lock(&shared.delivery) = None;
+        *lock(&shared.published_cards) = None;
         // Clear the constraint context: a stale roster must not gate a future session.
         let mut guard = lock(&shared.constraint);
         guard.context = None;
@@ -340,6 +360,10 @@ where
         drop(guard);
         // Clear the pool: a new session must start from a fresh baseline. The epoch bump
         // above already re-arms resolved-once: the stored epoch no longer matches.
+        //
+        // `all_relics_known` needs no reset: it describes the paths in `relics`, and those are
+        // cleared here. A pool with no paths names no relics, so the reader waits whatever the
+        // flag says. The next baseline sets the flag against its own paths.
         let mut pool = lock(&shared.pool);
         pool.relics.clear();
         pool.candidates.clear();
@@ -361,12 +385,11 @@ where
         let shared = &self.shared;
         let old_epoch = shared.epoch.load(Ordering::Acquire);
         if old_epoch != 0 {
-            // A session is open. Carry an already-published screen across the pause so its
-            // cards are not published a second time when the process returns.
-            let new_epoch = shared.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-            if self.resolved_epoch.load(Ordering::Acquire) == old_epoch {
-                self.resolved_epoch.store(new_epoch, Ordering::Release);
-            }
+            // A session is open. Retire the epoch so nothing captured under it can publish
+            // after the pause. The bump also re-arms resolved-once: the recorded epoch no longer
+            // matches, so the next look at the screen publishes. Epochs only ever increase, so a
+            // stale mark cannot match one again and needs no clearing.
+            shared.epoch.fetch_add(1, Ordering::AcqRel);
             shared.gate.retire();
         }
         // At cold start (epoch 0) there is no session: no epoch bump, no deadline arm, no
@@ -420,7 +443,13 @@ where
         }
         match delivery.kind {
             DeliveryKind::Recognized { cards, elapsed } => {
-                if self.resolved_epoch.load(Ordering::Acquire) == current_epoch {
+                // Resolved-once, but only for the SAME cards: a re-read of the screen the epoch
+                // already published is a duplicate, while a different set is a new result and
+                // must publish. `published_cards` is cleared when the screen reports gone, so a
+                // recovered read after an unreadable stretch is not mistaken for a duplicate.
+                if self.resolved_epoch.load(Ordering::Acquire) == current_epoch
+                    && lock(&shared.published_cards).as_deref() == Some(cards.as_slice())
+                {
                     return RecognitionUpdate::default();
                 }
                 let constraint = lock(&shared.constraint).clone();
@@ -443,6 +472,7 @@ where
                     return RecognitionUpdate::default();
                 }
                 self.resolved_epoch.store(current_epoch, Ordering::Release);
+                *lock(&shared.published_cards) = Some(cards.clone());
                 RecognitionUpdate {
                     recognized: Some(RecognizedRewards {
                         cards,
@@ -454,19 +484,32 @@ where
                         },
                     }),
                     hide: false,
+                    unreadable: false,
                     failure: None,
                 }
             }
             DeliveryKind::Failed { reason, elapsed } => RecognitionUpdate {
                 recognized: None,
                 hide: false,
+                unreadable: false,
                 failure: Some(FailureTrace { reason, elapsed }),
             },
-            DeliveryKind::Gone => RecognitionUpdate {
-                recognized: None,
-                hide: true,
-                failure: None,
-            },
+            DeliveryKind::Gone => {
+                // The screen may still be up and merely unreadable, so the cards are forgotten
+                // (a recovered read must publish again) while the epoch stays resolved (this
+                // epoch's screen is not republished from a duplicate delivery).
+                *lock(&shared.published_cards) = None;
+                // The one-shot publication mark is part of what was forgotten: without this a
+                // screen that went unreadable and came back could never show again, because the
+                // gate would still believe this epoch had already published.
+                shared.gate.retire();
+                RecognitionUpdate {
+                    recognized: None,
+                    hide: true,
+                    unreadable: true,
+                    failure: None,
+                }
+            }
         }
     }
 
@@ -483,6 +526,64 @@ where
     /// The full reward catalog this module was constructed with.
     pub fn rewards(&self) -> &[RewardCatalogEntry] {
         &self.shared.rewards
+    }
+
+    /// The two lists the worker matches a capture against: the squad's pool, then the reward
+    /// catalogue behind it.
+    ///
+    /// Cloned out only for tests. The worker holds the guards across its own capture so the
+    /// monitor's replacement cannot land between the two reads; a test has no capture, so it
+    /// takes them in turn and asks [`reward_ocr::resolve_card`] what that pair would name.
+    #[cfg(test)]
+    pub(crate) fn matching_candidates(&self) -> (Vec<RewardCatalogEntry>, Vec<RewardCatalogEntry>) {
+        let pool = lock(&self.shared.pool).entries.clone();
+        let catalogue = self
+            .shared
+            .card_catalogue
+            .read()
+            .map(|catalogue| catalogue.clone())
+            .unwrap_or_default();
+        (pool, catalogue)
+    }
+
+    /// Whether the relic table in use knows this projection path.
+    ///
+    /// The table is replaced when a newer one is fetched, so this answers for the table in
+    /// hand rather than for the one the session started with.
+    pub fn knows_relic(&self, projection_path: &str) -> bool {
+        self.shared
+            .relics
+            .read()
+            .ok()
+            .and_then(|relics| {
+                relics
+                    .as_ref()
+                    .map(|index| index.knows_projection_path(projection_path))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Replace the relic table with a newer one and rebuild the reward catalogue from it.
+    ///
+    /// The table is fetched once at startup and ages out while a session runs, so without this
+    /// the reader spends the rest of the evening matching against a table that predates the
+    /// relics the squad picked up. The catalogue is rebuilt alongside the table because it
+    /// carries the reward names the table lists, and a catalogue from the old table cannot name
+    /// a reward the new one knows.
+    ///
+    /// The pool is not rebuilt here. The next baseline does that, and it arrives with the paths
+    /// the squad actually loaded.
+    pub fn replace_relic_table(&self, relics: RelicRewardIndex) {
+        let catalogue = card_catalogue(&self.shared.rewards, Some(&relics));
+        if let Ok(mut current) = self.shared.relics.write() {
+            *current = Some(relics);
+        }
+        if let Ok(mut current) = self.shared.card_catalogue.write() {
+            *current = catalogue;
+        }
+        // The worker reads the table and the catalogue on every pass, so it has to see the
+        // change without waiting for the next wake.
+        self.wake_worker();
     }
 
     /// Whether the current epoch has already published a recognition.
@@ -519,10 +620,12 @@ fn lock<T>(guard: &Mutex<T>) -> MutexGuard<'_, T> {
 /// `make_source`, so a non-`Send` source never crosses a thread boundary.
 struct Shared {
     catalog: Option<CatalogIndex>,
-    relics: Option<RelicRewardIndex>,
+    /// The relic table, replaced when a newer one is fetched. Held behind a lock because the
+    /// worker reads it on every baseline and the monitor swaps it when the table ages out.
+    relics: RwLock<Option<RelicRewardIndex>>,
     rewards: Vec<RewardCatalogEntry>,
     /// What a near-exact read may name outside the pool. See [`card_catalogue`].
-    card_catalogue: Vec<RewardCatalogEntry>,
+    card_catalogue: RwLock<Vec<RewardCatalogEntry>>,
     timing: RecognitionTiming,
     epoch: Arc<AtomicU64>,
     revision: Arc<AtomicU64>,
@@ -531,6 +634,10 @@ struct Shared {
     pool: Arc<Mutex<PoolSnapshot>>,
     delivery: Arc<Mutex<Option<Delivery>>>,
     wake: Arc<(Mutex<WakeState>, Condvar)>,
+    /// The cards the current epoch last published, so a re-read of the same screen is dropped
+    /// while a different set is not. Cleared when the screen is reported gone or a new epoch
+    /// opens, which is what lets a recovered read publish again.
+    published_cards: Arc<Mutex<Option<Vec<RewardObservation>>>>,
     /// Set once by `shutdown`; the worker exits instead of waiting for the next epoch.
     stop: AtomicBool,
     /// Set while the game process is absent; the worker drops its source and waits without
@@ -547,6 +654,10 @@ struct PoolSnapshot {
     relics: Vec<String>,
     candidates: Vec<RewardNeedle>,
     entries: Vec<RewardCatalogEntry>,
+    /// Whether the relic table listed every path in this baseline. False means the table has
+    /// never heard of at least one of the squad's relics, so the pool it produced is missing
+    /// those relics' rewards and the catalogue cannot be used to name them.
+    all_relics_known: bool,
 }
 #[derive(Clone, Debug)]
 struct ConstraintContext {
@@ -624,7 +735,10 @@ fn derive_candidates(shared: &Shared, relic_paths: &[String]) -> Vec<RewardNeedl
     let Some(catalog) = shared.catalog.as_ref() else {
         return Vec::new();
     };
-    let Some(relics) = shared.relics.as_ref() else {
+    let Ok(relics) = shared.relics.read() else {
+        return Vec::new();
+    };
+    let Some(relics) = relics.as_ref() else {
         return Vec::new();
     };
     relics.candidates_for_projection_paths(relic_paths, catalog)
@@ -693,6 +807,22 @@ fn card_catalogue(
 fn names_logged_reward(card: &str, logged: &str) -> bool {
     warframe_acquisition::reward_name_matches(logged, card)
         || warframe_acquisition::reward_name_matches(card, logged)
+}
+
+/// What one capture attempt amounted to.
+///
+/// The distinction that matters is between a screen that could not be read and a screen that was
+/// read and refused. A refusal is evidence the screen is up: the cards were legible, they just
+/// disagreed with the log. Counting a refusal as a miss is what made two mismatched reads report
+/// a live screen as closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Attempt {
+    /// Cards were read and accepted.
+    Recognized,
+    /// The screen could not be read: blank, or nothing in the pool matched.
+    Unreadable,
+    /// Cards were read but the log's constraints rejected them. The screen is up.
+    Refused,
 }
 
 fn worker_loop(shared: Arc<Shared>) {
@@ -787,13 +917,32 @@ fn worker_loop(shared: Arc<Shared>) {
             continue;
         }
 
-        let (entries, relics_named) = {
+        let (entries, relics_named, all_relics_known) = {
             let pool = lock(&shared.pool);
-            (pool.entries.clone(), !pool.relics.is_empty())
+            (
+                pool.entries.clone(),
+                !pool.relics.is_empty(),
+                pool.all_relics_known,
+            )
         };
         // WFCD lists some live relics with no rewards, so a baseline can name relics and still
         // leave the pool empty while their cards are on screen. The catalogue can name those.
-        let readable = !entries.is_empty() || (relics_named && !shared.card_catalogue.is_empty());
+        //
+        // A pool the table emptied is a different thing. A relic the table has never heard of
+        // leaves the pool missing that relic's rewards, and with nothing of the squad's own to
+        // match against, the catalogue would name from all of Warframe instead of from what
+        // this squad can drop. That read is a guess wearing a confidence score, so the reader
+        // waits instead: a stale table gets refetched, and the next baseline resolves.
+        //
+        // The catalogue's emptiness is read without holding the lock across the wait below: the
+        // monitor replaces the catalogue when a newer table arrives, and a read guard held
+        // across that wait would block the replacement until the worker woke.
+        let catalogue_is_empty = match shared.card_catalogue.read() {
+            Ok(catalogue) => catalogue.is_empty(),
+            Err(_) => true,
+        };
+        let readable =
+            !entries.is_empty() || (relics_named && all_relics_known && !catalogue_is_empty);
         if !readable {
             // Nothing to match against. Do not capture; the next baseline wakes the worker.
             let _ = wait_for_wake(&shared, Some(shared.timing.interval));
@@ -835,13 +984,22 @@ fn worker_loop(shared: Arc<Shared>) {
         drop(constraint);
         let capture_epoch = shared.epoch.load(Ordering::Acquire);
 
-        let candidates = CardCandidates {
-            pool: &entries,
-            catalog: &shared.card_catalogue,
+        // The catalogue is held for the capture only. The monitor replaces it when a newer relic
+        // table arrives, and holding the read guard across the wait at the end of this pass would
+        // block that replacement until the worker woke.
+        let outcome = match shared.card_catalogue.read() {
+            Ok(card_catalogue) => {
+                let candidates = CardCandidates {
+                    pool: &entries,
+                    catalog: &card_catalogue,
+                };
+                let started = Instant::now();
+                let outcome = source.as_mut().map(|source| source.choices(candidates));
+                (outcome, started.elapsed())
+            }
+            Err(_) => (None, Duration::ZERO),
         };
-        let started = Instant::now();
-        let outcome = source.as_mut().map(|source| source.choices(candidates));
-        let elapsed = started.elapsed();
+        let (outcome, elapsed) = outcome;
 
         let deliver = |kind: DeliveryKind| {
             let mut slot = lock(&shared.delivery);
@@ -868,8 +1026,8 @@ fn worker_loop(shared: Arc<Shared>) {
             }
         };
 
-        // Returns true when this attempt recognized cards.
-        let recognized = match outcome {
+        // What this attempt amounted to. A refusal is not a miss: the cards were read.
+        let attempt = match outcome {
             Some(Ok(read)) if read.len() >= 2 => {
                 let cards = read
                     .into_iter()
@@ -903,7 +1061,7 @@ fn worker_loop(shared: Arc<Shared>) {
                             );
                         }
                     }
-                    false
+                    Attempt::Refused
                 } else if size_mismatch {
                     let reason = "the reward screen showed a different number of cards";
                     last_reason = Some(reason.into());
@@ -926,7 +1084,7 @@ fn worker_loop(shared: Arc<Shared>) {
                             );
                         }
                     }
-                    false
+                    Attempt::Refused
                 } else {
                     // Retain the exact pool alongside the published cards in the capture trace.
                     // At Info, so a stable build keeps it: a confident wrong read otherwise
@@ -959,7 +1117,7 @@ fn worker_loop(shared: Arc<Shared>) {
                     missed = 0;
                     fast_deadline = None;
                     fast_reported = true;
-                    true
+                    Attempt::Recognized
                 }
             }
             _ => {
@@ -985,12 +1143,13 @@ fn worker_loop(shared: Arc<Shared>) {
                         log::debug!("[DEBUG-recognition] read failed: {reason} (x{warn_streak})");
                     }
                 }
-                false
+                Attempt::Unreadable
             }
         };
 
-        if !recognized && found {
-            // A blank/mismatched read after cards were seen may mean the screen closed.
+        if attempt == Attempt::Unreadable && found {
+            // Only an unreadable look suggests the screen may have closed. A refused read is
+            // proof the screen is still up, so it must never count toward `Gone`.
             missed += 1;
             if missed >= 2 {
                 log::debug!("[DEBUG-recognition] reward screen gone");

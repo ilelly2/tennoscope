@@ -64,6 +64,13 @@ const CATALOG_JSON: &str = r#"[
   {"uniqueName":"/Lotus/Powersuits/BrokenFrame/XakuPrime","name":"Xaku Prime","type":"Warframe","category":"Warframes","masterable":true,"components":[
     {"uniqueName":"/Lotus/Types/Recipes/Warframes/XakuPrimeHelmetComponent","name":"Neuroptics","tradable":true,"ducats":15,"primeSellingPrice":15,"imageName":"XakuPrimeHelmet.png"}
   ]},
+  {"uniqueName":"/Lotus/Weapons/Tenno/Primary/CitrinePrime","name":"Citrine Prime","type":"Primary","category":"Primary","masterable":true,"components":[
+    {"uniqueName":"/Lotus/Types/Recipes/Weapons/CitrinePrimeBlueprint","name":"Blueprint","tradable":true,"ducats":45,"primeSellingPrice":45},
+    {"uniqueName":"/Lotus/Types/Recipes/Weapons/CitrinePrimeChassisComponent","name":"Chassis","tradable":true,"ducats":15,"primeSellingPrice":15,"imageName":"CitrinePrimeChassis.png"}
+  ]},
+  {"uniqueName":"/Lotus/Weapons/Tenno/Primary/CorufellPrime","name":"Corufell Prime","type":"Primary","category":"Primary","masterable":true,"components":[
+    {"uniqueName":"/Lotus/Types/Recipes/Weapons/CorufellPrimeReceiverComponent","name":"Receiver","tradable":true,"ducats":15,"primeSellingPrice":15,"imageName":"CorufellPrimeReceiver.png"}
+  ]},
   {"uniqueName":"/Lotus/Types/Items/MiscItems/Kuva","name":"Kuva","type":"Resource","category":"Resources"}
 ]"#;
 
@@ -106,6 +113,20 @@ fn catalog() -> CatalogIndex {
 
 fn relics() -> RelicRewardIndex {
     RelicRewardIndex::from_wfcd_json(RELICS_JSON.as_bytes()).expect("relic fixture parses")
+}
+
+/// A newer relic table, the kind a fetch during a session brings: it knows the relics the
+/// table in hand has never heard of.
+fn relics_with_citrine() -> RelicRewardIndex {
+    RelicRewardIndex::from_wfcd_json(
+        br#"[
+  {"uniqueName":"/Lotus/Types/Game/Projections/T4VoidProjectionStyanaxPrimeA21","name":"Styanax Prime A21","rewards":[
+    {"item":{"name":"Citrine Prime Chassis Blueprint"}},
+    {"item":{"name":"Corufell Prime Receiver"}}
+  ]}
+]"#,
+    )
+    .expect("the newer relic fixture parses")
 }
 
 fn rewards() -> Vec<RewardCatalogEntry> {
@@ -325,26 +346,28 @@ impl Coordination {
 fn recognition(
     coordination: &Arc<Coordination>,
 ) -> RewardRecognition<ScriptedSource, impl Fn() -> ScriptedSource + Send + Sync + 'static> {
+    recognition_with_table(coordination, Some(relics()))
+}
+
+/// A reader with the given relic table, so a test can start with no table at all.
+fn recognition_with_table(
+    coordination: &Arc<Coordination>,
+    relics: Option<RelicRewardIndex>,
+) -> RewardRecognition<ScriptedSource, impl Fn() -> ScriptedSource + Send + Sync + 'static> {
     let coordination_for_factory = Arc::clone(coordination);
-    RewardRecognition::new(
-        Some(catalog()),
-        Some(relics()),
-        rewards(),
-        timing(),
-        move || {
-            coordination_for_factory.made.fetch_add(1, Ordering::AcqRel);
-            ScriptedSource {
-                coordination: Arc::clone(&coordination_for_factory),
-                drop_signal: Some(
-                    coordination_for_factory
-                        .dropped
-                        .lock()
-                        .expect("drop lock")
-                        .clone(),
-                ),
-            }
-        },
-    )
+    RewardRecognition::new(Some(catalog()), relics, rewards(), timing(), move || {
+        coordination_for_factory.made.fetch_add(1, Ordering::AcqRel);
+        ScriptedSource {
+            coordination: Arc::clone(&coordination_for_factory),
+            drop_signal: Some(
+                coordination_for_factory
+                    .dropped
+                    .lock()
+                    .expect("drop lock")
+                    .clone(),
+            ),
+        }
+    })
 }
 
 fn wait_for_capture(coordination: &Coordination, expected: usize) {
@@ -502,6 +525,52 @@ fn duplicate_baselines_reuse_the_single_capture_source() {
     );
 }
 
+/// A squad whose relics are all absent from the relic table (a table older than
+/// the relics: 2026-07-28 against Citrine/Corufell/Steflos Prime) derives an
+/// empty pool. An empty pool is not enough on its own to stop the reader: the
+/// reward catalogue behind the pool can name a card, and that is legitimate
+/// when the table knows the relic and simply lists no rewards for it. It is not
+/// legitimate when the table has never heard of the relic, because then the
+/// catalogue is naming from the whole of Warframe with nothing to constrain it.
+///
+/// The two cases look identical to the reader today, which is why a stale table
+/// turns into a read against the whole reward catalogue instead of the squad's
+/// own six.
+#[test]
+fn a_relic_the_table_does_not_know_leaves_an_empty_pool_that_must_not_capture() {
+    let coordination = coordination(vec![Frame::Names(names(&[
+        entry("Citrine Prime Chassis Blueprint"),
+        entry("Corufell Prime Receiver"),
+    ]))]);
+    let mut recognition = recognition(&coordination);
+    // Two relics the 2026-07-28 table has never heard of.
+    recognition.observe(&baseline(&[
+        "/Lotus/Types/Game/Projections/T4VoidProjectionStyanaxPrimeA21",
+        "/Lotus/Types/Game/Projections/T4VoidProjectionStyanaxPrimeA22",
+    ]));
+    // Give the worker several cadence intervals: the assertion is that it never
+    // captures, so one interval proves nothing.
+    std::thread::sleep(Duration::from_millis(120));
+    let _ = recognition.poll();
+    assert_eq!(
+        recognition.candidates().len(),
+        0,
+        "two relics the table does not know must leave no candidates: the stale table resolved \
+         nothing for them, and that absence is the defect being pinned"
+    );
+    assert!(
+        recognition.pool_entries().is_empty(),
+        "a pool with no candidates must hold no reward entries, so no card can be named"
+    );
+    assert_eq!(
+        coordination.captures.load(Ordering::Acquire),
+        0,
+        "a relic the table has never heard of leaves nothing to constrain a card, so the reader \
+         must not capture against the whole catalogue"
+    );
+    recognition.shutdown();
+}
+
 /// A baseline that names no relics leaves nothing to match against, so
 /// nothing captures; the later baseline that names one starts the reader.
 #[test]
@@ -531,6 +600,26 @@ fn a_baseline_naming_no_relics_does_not_capture_until_one_does() {
     assert_eq!(
         card_names(&update),
         names(&[entry("Perigale Prime Receiver"), entry("Vasto Prime Stock")])
+    );
+    recognition.shutdown();
+}
+
+/// A reader with no relic table at all has nothing to constrain a read. The
+/// catalogue behind the pool would name any reward in the game, so the reader
+/// must wait for a table instead of capturing.
+#[test]
+fn a_reader_with_no_relic_table_never_captures() {
+    let coordination = coordination(vec![Frame::Names(names(&[
+        entry("Perigale Prime Receiver"),
+        entry("Vasto Prime Stock"),
+    ]))]);
+    let mut recognition = recognition_with_table(&coordination, None);
+    recognition.observe(&baseline(&[EARLY_RELIC]));
+    std::thread::sleep(Duration::from_millis(120)); // several capture intervals
+    assert_eq!(
+        coordination.captures.load(Ordering::Acquire),
+        0,
+        "with no table the catalogue is unconstrained, so no read is proof of anything"
     );
     recognition.shutdown();
 }
@@ -853,6 +942,53 @@ fn a_stacked_card_satisfies_the_logged_item() {
     assert_eq!(published, ["1200X Kuva", "Vasto Prime Stock"]);
 }
 
+/// The relic table is fetched once at startup and ages out while a session runs. A newer table
+/// arriving mid-session has to take effect, or the reader spends the rest of the evening
+/// matching against a table that predates the relics the squad picked up.
+///
+/// The table is replaced, then a new baseline arrives with the paths the squad loaded. The pool
+/// has to be derived from the new table, because a table fetched any other time would not be
+/// used until the next baseline anyway.
+#[test]
+fn a_relic_table_that_arrives_mid_session_resolves_the_next_baseline() {
+    let coordination = coordination(vec![Frame::Names(names(&[
+        entry("Citrine Prime Chassis Blueprint"),
+        entry("Corufell Prime Receiver"),
+    ]))]);
+    let mut recognition = recognition(&coordination);
+    let unknown = "/Lotus/Types/Game/Projections/T4VoidProjectionStyanaxPrimeA21".to_owned();
+
+    // The table in hand has never heard of the relic, so there is nothing to constrain a card.
+    recognition.observe(&baseline(&[unknown.as_str()]));
+    std::thread::sleep(Duration::from_millis(120));
+    let _ = recognition.poll();
+    assert_eq!(
+        coordination.captures.load(Ordering::Acquire),
+        0,
+        "the table in hand cannot name the relic, so the reader waits"
+    );
+    assert_eq!(
+        recognition.candidates().len(),
+        0,
+        "an unknown relic resolves to no candidates"
+    );
+
+    // A newer table arrives that knows the relic.
+    recognition.replace_relic_table(relics_with_citrine());
+    recognition.observe(&baseline(&[unknown.as_str()]));
+    wait_for_capture(&coordination, 1);
+    let update = drain_recognized(&mut recognition);
+    assert_eq!(
+        card_names(&update),
+        names(&[
+            entry("Citrine Prime Chassis Blueprint"),
+            entry("Corufell Prime Receiver"),
+        ]),
+        "the newer table must name the cards the squad's relics can drop"
+    );
+    recognition.shutdown();
+}
+
 /// `ChoicesReady`'s card count outranks the `ResponsesComplete` roster size:
 /// a read matching the roster but not the rendered count must not publish.
 #[test]
@@ -1045,6 +1181,179 @@ fn two_misses_close_the_screen_without_a_one_blank_flicker() {
         }
         std::thread::yield_now();
     }
+    recognition.shutdown();
+}
+
+/// A screen that goes unreadable and then comes back must show again. The cards were forgotten
+/// when it reported gone, so the recovered read is not a duplicate -- and the publication gate,
+/// which is one-shot per epoch, must have been retired too, or the second show would be declined.
+#[test]
+fn a_recovered_read_reshows_the_overlay_after_an_unreadable_stretch() {
+    let cards = names(&[entry("Perigale Prime Receiver"), entry("Vasto Prime Stock")]);
+    let coordination = coordination(vec![
+        Frame::Names(cards.clone()),
+        Frame::Gated(Box::new(Frame::Blank)),
+        Frame::Gated(Box::new(Frame::Blank)),
+        Frame::Gated(Box::new(Frame::Names(cards.clone()))),
+    ]);
+    let mut first_miss = GateGuard(Some(coordination.stack_gate()));
+    let mut second_miss = GateGuard(Some(coordination.stack_gate()));
+    let mut recovered = GateGuard(Some(coordination.stack_gate()));
+    let mut recognition = recognition(&coordination);
+    recognition.observe(&baseline(&[EARLY_RELIC]));
+
+    let update = drain_recognized(&mut recognition);
+    assert_eq!(card_names(&update), cards);
+    assert!(
+        update.publication.publish(|| {}),
+        "the first read must publish"
+    );
+
+    first_miss.release();
+    second_miss.release();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if recognition.poll().hide {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("two unreadable reads never reported the screen gone");
+        }
+        std::thread::yield_now();
+    }
+
+    // The screen is back with the same cards. Same epoch, same names -- only the gate and the
+    // forgotten card set stand between this read and a second show.
+    recovered.release();
+    let update = drain_recognized(&mut recognition);
+    assert_eq!(
+        card_names(&update),
+        cards,
+        "a recovered read must publish the same cards again"
+    );
+    assert!(
+        update.publication.publish(|| {}),
+        "a recovered read must be able to show the overlay again"
+    );
+    recognition.shutdown();
+}
+
+/// Cards the log's own constraints reject prove the screen is up: they were read. A refusal is
+/// therefore not a miss, and two of them must not report a live screen as closed.
+///
+/// The screen has to be recognized first. A screen that was never read has nothing to close, so
+/// the miss counter never runs and the test would pass whatever the refusal counted as.
+#[test]
+fn a_refused_read_is_not_a_closed_screen() {
+    let read = names(&[entry("Vasto Prime Stock"), entry("Burston Prime Receiver")]);
+    // The first frame carries no constraint, so it is published and the screen counts as found.
+    // The second repeats, so every read from here on is the same screen and stays refused. A
+    // script that ran out would read blank, and a blank screen is a different case: it is the
+    // screen going away.
+    let coordination = coordination(vec![
+        Frame::Gated(Box::new(Frame::Names(read.clone()))),
+        Frame::Names(read),
+    ]);
+    let mut recognition = recognition(&coordination);
+    recognition.observe(&baseline(&[EARLY_RELIC]));
+    let mut gate = GateGuard(Some(coordination.stack_gate()));
+    wait_for_capture(&coordination, 1);
+    gate.release();
+    drain_recognized(&mut recognition);
+
+    // The local player's reward is a Perigale receiver, so every read from here on is refused.
+    recognition.observe(&choices_ready(
+        2,
+        Some("/Lotus/StoreItems/Types/Recipes/Weapons/PerigalePrimeReceiverComponent"),
+    ));
+
+    let deadline = Instant::now() + Duration::from_millis(600);
+    let mut saw_failure = false;
+    while Instant::now() < deadline {
+        let update = recognition.poll();
+        assert!(
+            !update.hide,
+            "a refused read must never report the screen as closed"
+        );
+        saw_failure |= update.failure.is_some();
+        std::thread::yield_now();
+    }
+    assert!(
+        saw_failure,
+        "the refusal must still be reported as a diagnosis"
+    );
+    recognition.shutdown();
+}
+
+/// The log's card count outranks the read. A screen read at the wrong width is refused for the
+/// same reason, so it must not count as a miss either.
+///
+/// As with the refused read, the screen is recognized first: a screen that was never read has
+/// nothing to close, so the miss counter would never run.
+#[test]
+fn a_size_refused_read_is_not_a_closed_screen() {
+    let read = names(&[entry("Vasto Prime Stock"), entry("Burston Prime Receiver")]);
+    // The first frame carries no constraint, so it is published and the screen counts as found.
+    // The second repeats, so every read from here on is the same screen and stays refused. A
+    // script that ran out would read blank, and a blank screen is a different case: it is the
+    // screen going away.
+    let coordination = coordination(vec![
+        Frame::Gated(Box::new(Frame::Names(read.clone()))),
+        Frame::Names(read),
+    ]);
+    let mut recognition = recognition(&coordination);
+    recognition.observe(&baseline(&[EARLY_RELIC]));
+    let mut gate = GateGuard(Some(coordination.stack_gate()));
+    wait_for_capture(&coordination, 1);
+    gate.release();
+    drain_recognized(&mut recognition);
+
+    // Three cards were played; this screen reads two.
+    recognition.observe(&choices_ready(3, None));
+
+    let deadline = Instant::now() + Duration::from_millis(600);
+    let mut saw_failure = false;
+    while Instant::now() < deadline {
+        let update = recognition.poll();
+        assert!(
+            !update.hide,
+            "a wrong-width read must never report the screen as closed"
+        );
+        saw_failure |= update.failure.is_some();
+        std::thread::yield_now();
+    }
+    assert!(
+        saw_failure,
+        "the refusal must still be reported as a diagnosis"
+    );
+    recognition.shutdown();
+}
+
+/// A suspend between two screens must not carry the old epoch's resolved mark into the new one,
+/// or the second screen's read would be dropped as a duplicate forever.
+#[test]
+fn a_suspend_and_resume_between_two_screens_still_shows_the_second_read() {
+    let cards = names(&[entry("Perigale Prime Receiver"), entry("Vasto Prime Stock")]);
+    let coordination = coordination(vec![Frame::Names(cards.clone())]);
+    let mut recognition = recognition(&coordination);
+    recognition.observe(&baseline(&[EARLY_RELIC]));
+    let first = drain_recognized(&mut recognition);
+    assert_eq!(card_names(&first), cards);
+
+    // The game process vanishes and returns between missions.
+    recognition.suspend();
+    recognition.resume();
+
+    let second = drain_recognized(&mut recognition);
+    assert_eq!(
+        card_names(&second),
+        cards,
+        "the next screen must show its own read, not inherit the last screen's suppression"
+    );
+    assert!(
+        second.publication.publish(|| {}),
+        "the next screen must publish afresh"
+    );
     recognition.shutdown();
 }
 

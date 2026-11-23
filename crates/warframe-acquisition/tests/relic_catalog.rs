@@ -51,6 +51,39 @@ fn loaded_projection_paths_resolve_to_deduplicated_reward_needles() {
 }
 
 #[test]
+fn relic_paths_absent_from_the_table_are_reported() {
+    let relics = RelicRewardIndex::from_wfcd_json(
+        br#"[{
+          "uniqueName":"/Lotus/Types/Game/Projections/TestABronze",
+          "rewards":[{"item":{"name":"Forma Blueprint"}}]
+        }]"#,
+    )
+    .unwrap();
+    let catalog = CatalogIndex::from_wfcd_json(
+        br#"[{
+          "uniqueName":"/Lotus/Types/Recipes/Components/FormaBlueprint",
+          "name":"Forma Blueprint",
+          "type":"Blueprint",
+          "category":"Blueprints"
+        }]"#,
+    )
+    .unwrap();
+    let asked = [
+        "/Lotus/Types/Game/Projections/TestABronze".to_owned(),
+        "/Lotus/Types/Game/Projections/T5VoidProjectionCitrineAPlatinum".to_owned(),
+    ];
+
+    assert_eq!(
+        relics.known_projection_path_count(&asked),
+        1,
+        "only the path the table lists is known"
+    );
+    let candidates = relics.candidates_for_projection_paths(&asked, &catalog);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].choice_name(), "Forma Blueprint");
+}
+
+#[test]
 fn unrelated_projection_paths_produce_no_candidates() {
     let relics = RelicRewardIndex::from_wfcd_json(br#"[]"#).unwrap();
     let catalog = CatalogIndex::default();
@@ -59,6 +92,45 @@ fn unrelated_projection_paths_produce_no_candidates() {
         relics
             .candidates_for_projection_paths(&["/Lotus/Unknown".into()], &catalog)
             .is_empty()
+    );
+}
+
+/// A relic the table lists with no rewards is a relic the table knows. Dropping it made the
+/// two cases indistinguishable: "the table knows this relic and has no rewards for it" and "the
+/// table has never heard of this relic" both left the pool empty, and only the second one means
+/// the table is too old to name anything.
+#[test]
+fn a_relic_the_table_lists_without_rewards_is_still_a_relic_the_table_knows() {
+    let relics = RelicRewardIndex::from_wfcd_json(
+        br#"[{
+          "uniqueName":"/Lotus/Types/Game/Projections/TestARewardless",
+          "rewards":[]
+        }]"#,
+    )
+    .unwrap();
+    let known = "/Lotus/Types/Game/Projections/TestARewardless".to_owned();
+    let unknown = "/Lotus/Types/Game/Projections/T5VoidProjectionCitrineAPlatinum".to_owned();
+
+    assert!(
+        relics.knows_projection_path(&known),
+        "a relic the table lists with no rewards is still known"
+    );
+    assert!(
+        !relics.knows_projection_path(&unknown),
+        "a relic the table never listed is not known"
+    );
+    assert_eq!(
+        relics.known_projection_path_count(&[known.clone(), unknown.clone()]),
+        1
+    );
+    assert_eq!(
+        relics.relic_count(),
+        1,
+        "the rewardless relic is counted as a relic"
+    );
+    assert!(
+        relics.is_empty(),
+        "a table with no rewards at all cannot name a card"
     );
 }
 

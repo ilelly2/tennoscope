@@ -14,6 +14,38 @@ see the difference.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A relic the reward table has never heard of no longer makes the overlay name the wrong
+  reward.** The relic table the reader matched against was pinned to a commit from 2026-07-24,
+  so a relic released after it resolved to no rewards and the reader fell back to the nearest
+  name it did know. The table now follows the upstream `master` branch, a cached copy is refetched
+  once it is a day old, and every stored generation records the schema version that wrote it, so
+  a build with a different schema refetches instead of trusting the file. A session that outlives
+  the day refreshes the table on its next baseline, and the pool and reward catalogue are rebuilt
+  from the new one.
+
+- **A squad relic the table cannot resolve no longer produces a guessed reward name.** A relic
+  WFCD lists with no rewards is now known to the table rather than absent from it, so that pool
+  is read against the reward catalogue. When the table does not know the relic at all, the
+  reader captures nothing and waits for a newer table instead of publishing a read no relic
+  constrains.
+
+- **A reward name must be near-exact, and a name one edit away from a sibling names nothing.**
+  Card admission is an exact integer edit budget instead of a float score, so no rounding moves a
+  card across a threshold. A whole-card read inside the pool's band stands untouched, while a
+  fragment has to clear the tighter trusted band; that keeps a stray word such as `Blueprint`
+  from naming a card it cannot identify. A read a single edit away from a second reward is
+  reported as ambiguous instead of being published as the nearer one, and a blank card is no
+  longer confused with a card whose text matched nothing. The Ducat Kiosk applies the same band
+  to each slot: a tile whose read is outside it renders nothing rather than a guessed price.
+
+- **The preview toggle starts from the strip's real state.** The overlay's visibility now lives
+  in one backend value, written by every show and hide. The Settings toggle reads that value
+  when it mounts and follows the backend on every change, so a screen that closes on its own, or a
+  preview shown from another tab, can no longer leave the button claiming the strip is down when
+  it is up.
+
 ## [0.14.0] - 2026-10-30
 
 ### Added

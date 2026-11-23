@@ -30,7 +30,8 @@ import {
   type MarketOrder,
   type Presence,
 } from './backend'
-import { hideRewardOverlay, showRewardOverlay } from './overlay'
+import { getRewardOverlayVisibility, hideRewardOverlay, showRewardOverlay } from './overlay'
+import { listen } from '@tauri-apps/api/event'
 import { copyReport, openIssue, saveReport } from './report'
 import { closeWindow, minimizeWindow, readWindowMaximized, toggleMaximizeWindow, watchWindowResized } from './window'
 import { RewardCards } from './RewardCards'
@@ -1380,6 +1381,35 @@ function AboutPage({ effectiveMode }: { effectiveMode: AccessMode }) {
 function OverlayPreviewToggle({ prohibited, busy }: { prohibited: boolean; busy: boolean }) {
   const [shown, setShown] = useState(false)
   const [blocked, setBlocked] = useState(false)
+  // The backend is the authority on whether the strip is up: it hides it when the reward screen
+  // closes, which the toggle never sees. Mirror what it reports, or the button would claim the
+  // strip is up after it has gone.
+  useEffect(() => {
+    let active = true
+    let unlisten: (() => void) | undefined
+    let reported = false
+    // Subscribe first, then ask: the event reports changes from now on, and the strip may
+    // already be up when the toggle mounts. Doing the read after the listener is live means a
+    // change that races the answer arrives as an event and wins; without the read, a toggle
+    // mounted after the last change would start from the wrong answer and offer to show a strip
+    // that is already there.
+    void listen<{ visible: boolean, cards: number }>('reward-overlay-visibility', (event) => {
+      if (!active) return
+      reported = true
+      setShown(event.payload.visible)
+    }).then(stop => {
+      if (active) unlisten = stop
+      else stop()
+      if (!active) return
+      void getRewardOverlayVisibility().then(visible => {
+        if (active && !reported) setShown(visible)
+      }).catch(() => {})
+    })
+    return () => {
+      active = false
+      unlisten?.()
+    }
+  }, [])
   return <div className="prohibited-control">
     <button
       type="button"
@@ -1388,13 +1418,11 @@ function OverlayPreviewToggle({ prohibited, busy }: { prohibited: boolean; busy:
       disabled={prohibited || busy}
       aria-describedby={prohibited ? 'overlay-prohibited' : blocked ? 'overlay-blocked' : undefined}
       onClick={() => {
-        // The backend rejects while an access transition holds the gate. Flip only after the
-        // command lands, so a click across a downgrade reports instead of desyncing the toggle.
-        const next = !shown
+        // The backend rejects while an access transition holds the gate, and it owns the
+        // strip's visibility. It reports the new state once the command lands, so the toggle
+        // never guesses: a click across a downgrade reports instead of desyncing the toggle.
         setBlocked(false)
-        void (shown ? hideRewardOverlay() : showRewardOverlay())
-          .then(() => setShown(next))
-          .catch(() => setBlocked(true))
+        void (shown ? hideRewardOverlay() : showRewardOverlay()).catch(() => setBlocked(true))
       }}
     ><span>{shown ? 'Hide reward overlay' : 'Preview reward overlay'}</span></button>
     {prohibited && <p id="overlay-prohibited" className="prohibition-note">Overlay or Full access is required because Companion does not create overlays.</p>}
