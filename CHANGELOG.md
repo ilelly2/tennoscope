@@ -14,6 +14,8 @@ see the difference.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-23
+
 ### Fixed
 
 - **A relic the reward table has never heard of no longer makes the overlay name the wrong
@@ -842,7 +844,8 @@ First release.
 - Raw inventory responses are validated in memory and are not persisted.
 - No telemetry, no analytics, no remote account, no secret persistence.
 
-[Unreleased]: https://github.com/Deftera186/tennoscope/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/ilelly2/tennoscope/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/ilelly2/tennoscope/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/Deftera186/tennoscope/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/Deftera186/tennoscope/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/Deftera186/tennoscope/compare/v0.12.1-rc1...v0.13.0
