@@ -47,6 +47,12 @@ sh "$feed" --version 0.12.0 --tag v0.12.0-rc1 --artifacts "$artifacts" --out "$o
 check "rc writes only the beta feed" sh -c "! test -f '$out/latest.json' && test -f '$out/latest-beta.json'"
 check "rc beta feed carries the tag suffix" grep -q '"version": "0.12.0-rc1"' "$out/latest-beta.json"
 
+# ilelly2 fork tags end their version in f (v0.12.0f-rc1); the feed must still stamp semver.
+rm -f "$out"/*.json
+sh "$feed" --version 0.12.0 --tag v0.12.0f-rc1 --artifacts "$artifacts" --out "$out" >/dev/null
+check "fork rc feed stamps the workspace version, not the tag" grep -q '"version": "0.12.0-rc1"' "$out/latest-beta.json"
+check "fork rc feed still downloads from the fork tag" grep -q "releases/download/v0.12.0f-rc1/" "$out/latest-beta.json"
+
 rm -f "$artifacts/nsis/TennoScope-0.12.0-x86_64-setup.exe.sig"
 check "missing sig fails closed" sh -c "! sh '$feed' --version 0.12.0 --tag v0.12.0 --artifacts '$artifacts' --out '$out' >/dev/null 2>&1"
 : >"$artifacts/nsis/TennoScope-0.12.0-x86_64-setup.exe.sig"

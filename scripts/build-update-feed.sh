@@ -51,11 +51,15 @@ if [ "$is_prerelease" = true ]; then
   # its own running build. Stamp prerelease feeds with the tag suffix
   # (0.12.0-rc1 < 0.12.0) so the self-offer can never happen; the later
   # stable 0.12.0 still satisfies the beta comparator.
-  version="${tag#v}"
-  case "$version" in
-    *"-"*) ;;
-    *) echo "prerelease tag '$tag' has no version suffix -- refusing to guess" >&2; exit 1 ;;
+  #
+  # The suffix is joined onto the workspace version rather than the tag being
+  # copied whole: the ilelly2 fork's tags carry an `f` (v0.12.0f-rc1), and
+  # 0.12.0f-rc1 is not semver. The release gate has already proved the tag
+  # names this version.
+  case "$tag" in
+    *"-") echo "prerelease tag '$tag' has no version suffix -- refusing to guess" >&2; exit 1 ;;
   esac
+  version="$version-${tag#*-}"
 fi
 
 # One updater entry per artifact kind present. deb/rpm are installable system
