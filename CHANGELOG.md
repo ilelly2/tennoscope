@@ -14,6 +14,19 @@ see the difference.
 
 ## [Unreleased]
 
+### Added
+- **A hotkey for the Ducat Kiosk prices.** Pick a key under Settings → Preferences. At the
+  kiosk, the first press brings the prices up and reads the grid again at once instead of
+  waiting for it to settle; the next press hides them until your next visit. There is no
+  default key, and a bare letter, number or Space is refused, since it would fire in chat.
+
+### Fixed
+- **A half-hidden top row of the Ducat Kiosk keeps its prices.** A card scrolled partly behind
+  the grid's top edge took its price chip out of view with its corner, even though its name was
+  still on screen. The chip now sits just inside the edge, clear of the name.
+- **No white line around the overlays on Windows 10.** Windows drew a 1px white border around
+  the transparent kiosk and reward overlays, which showed as a hairline frame over the game.
+
 ## [0.14.1] - 2026-11-23
 
 ### Fixed

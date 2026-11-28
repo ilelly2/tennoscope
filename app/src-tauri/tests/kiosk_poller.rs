@@ -200,6 +200,7 @@ fn run_with_strips(
     spawn_kiosk_poller_with(
         &reanchor,
         &gone_arg,
+        &Arc::new(AtomicBool::new(false)),
         timing(),
         candidates(),
         joiner,
@@ -428,6 +429,7 @@ fn the_external_close_verdict_stops_the_poller() {
     let handle = spawn_kiosk_poller_with(
         &reanchor,
         &gone_arg,
+        &Arc::new(AtomicBool::new(false)),
         timing(),
         candidates(),
         |_epoch, _frame| KioskView::default(),

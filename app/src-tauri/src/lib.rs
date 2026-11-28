@@ -32,6 +32,7 @@ use warframe_acquisition::WindowsProc as GameMemory;
 
 mod access;
 mod kiosk_geometry;
+mod kiosk_hotkey;
 mod kiosk_log;
 mod kiosk_ocr;
 mod kiosk_scroll;
@@ -786,7 +787,7 @@ async fn get_preferences(state: State<'_, SharedRuntime>) -> Result<Preferences,
         let runtime = shared
             .lock()
             .map_err(|_| "application state is unavailable".to_owned())?;
-        Ok(runtime.preferences)
+        Ok(runtime.preferences.clone())
     })
     .await
     .map_err(|_| "preferences task failed".to_owned())?
@@ -813,10 +814,56 @@ fn save_mastery_marks(runtime: &mut Runtime, enabled: bool) -> Result<Preference
     // the switch never claims a choice that did not stick.
     let next = Preferences {
         mastery_marks: enabled,
+        ..runtime.preferences.clone()
     };
-    preferences::save_preferences(&runtime.preferences_path, next)
+    preferences::save_preferences(&runtime.preferences_path, &next)
         .map_err(|_| "mastery marks setting could not be saved".to_owned())?;
-    runtime.preferences = next;
+    runtime.preferences = next.clone();
+    Ok(next)
+}
+
+#[tauri::command]
+async fn set_kiosk_hotkey(
+    app: AppHandle,
+    state: State<'_, SharedRuntime>,
+    accelerator: Option<String>,
+) -> Result<Preferences, String> {
+    let shared = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let wanted = kiosk_hotkey::normalize(accelerator.as_deref());
+        let previous = shared
+            .lock()
+            .map_err(|_| "application state is unavailable".to_owned())?
+            .preferences
+            .kiosk_hotkey
+            .clone();
+        // Register before saving: a key Windows refuses must not be written down as the
+        // player's choice and then fail silently at every launch after this one.
+        kiosk_hotkey::register(&app, wanted.as_deref()).inspect_err(|_| {
+            let _ = kiosk_hotkey::register(&app, previous.as_deref());
+        })?;
+        let mut runtime = shared
+            .lock()
+            .map_err(|_| "application state is unavailable".to_owned())?;
+        save_kiosk_hotkey(&mut runtime, wanted).inspect_err(|_| {
+            let _ = kiosk_hotkey::register(&app, previous.as_deref());
+        })
+    })
+    .await
+    .map_err(|_| "preferences task failed".to_owned())?
+}
+
+fn save_kiosk_hotkey(
+    runtime: &mut Runtime,
+    accelerator: Option<String>,
+) -> Result<Preferences, String> {
+    let next = Preferences {
+        kiosk_hotkey: accelerator,
+        ..runtime.preferences.clone()
+    };
+    preferences::save_preferences(&runtime.preferences_path, &next)
+        .map_err(|_| "the hotkey could not be saved".to_owned())?;
+    runtime.preferences = next.clone();
     Ok(next)
 }
 
@@ -2230,6 +2277,26 @@ pub fn run() {
             // The kiosk window's whole IPC surface: `get_kiosk_view` pulls whatever the poller
             // last published, so the cell exists from the start, empty until a kiosk opens.
             app.manage(kiosk_view::KioskState::default());
+            app.manage(kiosk_hotkey::KioskToggle::default());
+            // Installed at runtime rather than on the builder: a desktop session that cannot
+            // grab global keys (a Wayland compositor without them) must lose the hotkey, not
+            // the app.
+            match app
+                .handle()
+                .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+            {
+                Ok(()) => {
+                    let stored = app
+                        .state::<SharedRuntime>()
+                        .lock()
+                        .ok()
+                        .and_then(|runtime| runtime.preferences.kiosk_hotkey.clone());
+                    if let Err(error) = kiosk_hotkey::register(app.handle(), stored.as_deref()) {
+                        log::warn!("kiosk hotkey not registered: {error}");
+                    }
+                }
+                Err(error) => log::warn!("global hotkeys unavailable: {error}"),
+            }
             if let Some(access_mode) = startup.access_mode {
                 start_collection_prices(Arc::clone(app.state::<SharedRuntime>().inner()));
                 // The stored mode is installed here without a transition, so the switch a
@@ -2269,6 +2336,7 @@ pub fn run() {
             get_setup_status,
             get_preferences,
             set_mastery_marks,
+            set_kiosk_hotkey,
             set_access_mode,
             authorize_screen_capture,
             refresh_inventory,
@@ -2432,6 +2500,29 @@ mod tests {
             main.get("minHeight").is_none(),
             "an X11 compositor may tile below the hint; WebKitGTK can stay blank until another resize"
         );
+    }
+
+    /// An undecorated window keeps Windows' default shadow unless told otherwise, and on Windows
+    /// 10 that shadow is drawn as a 1px white border: over a transparent, click-through overlay
+    /// it shows as a hairline frame around the game (reported 2026-11-28 on the kiosk). Linux
+    /// draws no such border, which is why it went unseen.
+    #[test]
+    fn overlay_windows_draw_no_border() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid Tauri config");
+        for label in ["reward-overlay", "kiosk-overlay"] {
+            let window = config["app"]["windows"]
+                .as_array()
+                .expect("window list")
+                .iter()
+                .find(|window| window["label"] == label)
+                .unwrap_or_else(|| panic!("{label} window"));
+            assert_eq!(
+                window["shadow"],
+                serde_json::Value::Bool(false),
+                "{label} must opt out of the shadow Windows draws as a white border"
+            );
+        }
     }
 
     /// The preview has no screen to measure, so it must not guess a width: it mirrors the last
@@ -2665,13 +2756,49 @@ mod tests {
         assert_eq!(
             save_mastery_marks(&mut runtime, false),
             Ok(Preferences {
-                mastery_marks: false
+                mastery_marks: false,
+                kiosk_hotkey: None,
             })
         );
         assert!(!runtime.preferences.mastery_marks);
         assert!(
             !preferences::load_preferences(&writable).mastery_marks,
             "the file holds the new choice"
+        );
+    }
+
+    /// The hotkey saves like the marks: a failed write keeps the old key, and a good one keeps
+    /// the marks choice it did not touch.
+    #[test]
+    fn the_kiosk_hotkey_saves_beside_the_marks_and_only_when_the_write_lands() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let shared = test_runtime(directory.path());
+        let mut runtime = shared.lock().expect("lock");
+        let regular_file = directory.path().join("not-a-directory");
+        fs::write(&regular_file, b"").expect("regular file");
+        runtime.preferences_path = regular_file.join("tennoscope-preferences.json");
+        assert_eq!(
+            save_kiosk_hotkey(&mut runtime, Some("F8".to_owned()))
+                .err()
+                .as_deref(),
+            Some("the hotkey could not be saved")
+        );
+        assert_eq!(runtime.preferences.kiosk_hotkey, None);
+
+        let writable = directory.path().join("tennoscope-preferences.json");
+        runtime.preferences_path = writable.clone();
+        save_mastery_marks(&mut runtime, false).expect("marks saved");
+        let saved = save_kiosk_hotkey(&mut runtime, Some("F8".to_owned())).expect("hotkey saved");
+        assert_eq!(saved.kiosk_hotkey.as_deref(), Some("F8"));
+        assert!(
+            !saved.mastery_marks,
+            "the marks choice survives a hotkey save"
+        );
+        assert_eq!(
+            preferences::load_preferences(&writable)
+                .kiosk_hotkey
+                .as_deref(),
+            Some("F8")
         );
     }
 

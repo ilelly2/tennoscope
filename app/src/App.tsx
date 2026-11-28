@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react'
 import './App.css'
 import {
   authorizeScreenCapture,
@@ -19,6 +19,7 @@ import {
   setMarketPresence,
   setAccessMode,
   setMasteryMarks,
+  setKioskHotkey,
   setOrderQuantity,
   type AppView,
   type BackendHealth,
@@ -46,6 +47,7 @@ import { bootUpdateChecks } from './updateStore'
 import { version as APP_VERSION } from '../package.json'
 import { UpdateMark, UpdatesSetting } from './UpdateSettings'
 import { reportBlockVisible } from './reportable'
+import { hotkeyFromKey } from './hotkey'
 import { AccessSelector } from './AccessSelector'
 import { accessMode } from './access'
 
@@ -1199,6 +1201,8 @@ function SettingsPage({ view, priceFloor, effectiveMode, selectedMode, modeBusy,
 
       <MasteryMarksSetting/>
 
+      <KioskHotkeySetting/>
+
       <DesktopCaptureSetting actionAvailable={effectiveMode !== 'companion' && desktopCaptureActionAvailable} prohibited={effectiveMode === 'companion'} busy={captureAuthorizationBusy} note={captureNote} onNote={onCaptureNote} onAuthorize={onAuthorizeCapture}/>
 
       <div className="setting">
@@ -1220,6 +1224,85 @@ function SettingsPage({ view, priceFloor, effectiveMode, selectedMode, modeBusy,
   </section>
 }
 
+
+/** A backend refusal arrives as a lower-case clause; the note shows it as a sentence. */
+function sentence(reason: unknown): string {
+  const text = typeof reason === 'string' && reason ? reason : 'Could not save this setting'
+  const capital = text.charAt(0).toUpperCase() + text.slice(1)
+  return capital.endsWith('.') ? capital : `${capital}.`
+}
+
+/** The kiosk hotkey is registered by the backend, which may refuse a key another program holds.
+ * Like the marks switch, the row shows what the backend now holds, never what was asked for. */
+function KioskHotkeySetting() {
+  const [hotkey, setHotkey] = useState<string | null>(null)
+  const [listening, setListening] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+    getPreferences()
+      .then(preferences => { if (mounted) setHotkey(preferences.kiosk_hotkey ?? null) })
+      .catch(() => { if (mounted) setNote('Could not read this setting.') })
+    return () => { mounted = false }
+  }, [])
+
+  async function save(accelerator: string | null) {
+    setBusy(true)
+    setNote(null)
+    try {
+      const preferences = await setKioskHotkey(accelerator)
+      setHotkey(preferences.kiosk_hotkey ?? null)
+    } catch (reason) {
+      setNote(sentence(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function capture(event: ReactKeyboardEvent<HTMLButtonElement>) {
+    if (!listening) return
+    event.preventDefault()
+    if (event.key === 'Escape') {
+      setListening(false)
+      setNote(null)
+      return
+    }
+    const captured = hotkeyFromKey(event)
+    if (!captured) return
+    if ('problem' in captured) {
+      setNote(captured.problem)
+      return
+    }
+    setListening(false)
+    void save(captured.accelerator)
+  }
+
+  return <div className="setting">
+    <div>
+      <h3>Ducat Kiosk price hotkey</h3>
+      <p className="prose">At the Ducat Kiosk, press it to bring the prices up and read the grid again at once; press it again to hide them until your next visit. It works while Warframe has focus. There is no default key, so nothing you already use in game is taken.</p>
+    </div>
+    <div className="hotkey-row">
+      <kbd className="hotkey-current">{hotkey ?? 'Not set'}</kbd>
+      <button
+        type="button"
+        className="stamp"
+        disabled={busy}
+        aria-busy={busy}
+        onClick={() => { setNote(null); setListening(true) }}
+        onKeyDown={capture}
+        onBlur={() => setListening(false)}
+      >
+        {listening ? 'Press a key…' : 'Set key'}
+      </button>
+      {hotkey && !listening &&
+        <button type="button" className="stamp" disabled={busy} onClick={() => { void save(null) }}>Clear</button>}
+    </div>
+    {note && <p className="band-note" role="status">{note}</p>}
+  </div>
+}
 
 /** The preference lives in the backend and a click is a command it may refuse. A refusal leaves
  * the switch where it was and says so, so the thumb never claims a state the overlays are not in. */

@@ -1370,6 +1370,11 @@ pub(crate) fn run(
     let kiosk_spawn = |session: u64,
                        reanchor: &Arc<std::sync::atomic::AtomicBool>,
                        gone: &Arc<std::sync::atomic::AtomicBool>| {
+        // Every visit starts shown, with the hotkey's read-now request cleared.
+        let refresh = app
+            .try_state::<crate::kiosk_hotkey::KioskToggle>()
+            .map(|toggle| toggle.begin_visit())
+            .unwrap_or_default();
         let chips: ChipsState = Arc::new(std::sync::Mutex::new(None));
         let joiner = {
             let shared = Arc::clone(&shared);
@@ -1387,7 +1392,11 @@ pub(crate) fn run(
                 // The next capture must not see what this view paints: hand the source the
                 // published view so it masks the chips (only on the session that owns them).
                 if kiosk.set_if_current(session, view.clone(), || {
-                    if first_publish.swap(false, Ordering::AcqRel) {
+                    // A visit the player hid with the hotkey stays hidden until they bring it back.
+                    let hidden = app
+                        .try_state::<crate::kiosk_hotkey::KioskToggle>()
+                        .is_some_and(|toggle| toggle.hidden());
+                    if first_publish.swap(false, Ordering::AcqRel) && !hidden {
                         // On native Wayland the open log marker arrives before capture has located
                         // the game monitor. The first show is deliberately deferred; retry now that
                         // `select_kiosk_strip` has published the matched capture rectangle.
@@ -1421,6 +1430,7 @@ pub(crate) fn run(
         let poller = spawn_kiosk_poller_with(
             reanchor,
             gone,
+            &refresh,
             KioskPollerTiming::live(),
             Arc::clone(&kiosk_candidates),
             joiner,
@@ -1936,6 +1946,7 @@ const KIOSK_UNMEASURED_READ_LOOKS: u32 = 3;
 pub fn spawn_kiosk_poller_with<S, J, P, E>(
     reanchor: &Arc<std::sync::atomic::AtomicBool>,
     gone: &Arc<std::sync::atomic::AtomicBool>,
+    refresh: &Arc<std::sync::atomic::AtomicBool>,
     timing: KioskPollerTiming,
     candidates: Arc<Vec<RewardCatalogEntry>>,
     joiner: J,
@@ -1951,6 +1962,7 @@ where
 {
     let reanchor = Arc::clone(reanchor);
     let gone = Arc::clone(gone);
+    let refresh = Arc::clone(refresh);
     std::thread::spawn(move || {
         let mut source = make_source();
         let mut epoch = 0_u64;
@@ -2093,7 +2105,9 @@ where
             // grid's own label rows name the offset at any scroll position, so the crops land on
             // the text instead of the gaps. An unmeasured run that fell through above bypasses
             // the two-look gate for this one read; the locator gates it on its own.
-            let read_now = unmeasured_fell_through;
+            // The player's hotkey asks for a read now: the grid is still on this look, which is
+            // all the second look would have proved, so the wait is the only thing it skips.
+            let read_now = unmeasured_fell_through | refresh.swap(false, Ordering::AcqRel);
             unmeasured_fell_through = false;
             if !read_now {
                 static_looks = static_looks.saturating_add(1);
@@ -3023,6 +3037,22 @@ mod tests {
     where
         S: KioskFrameSource + Send + 'static,
     {
+        run_poller_asked(source, candidates, false)
+    }
+
+    /// `read_now` stands for the player's hotkey having asked for a read before the first look.
+    fn run_poller_asked<S>(
+        source: S,
+        candidates: Vec<RewardCatalogEntry>,
+        read_now: bool,
+    ) -> (
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<StdMutex<Vec<KioskView>>>,
+    )
+    where
+        S: KioskFrameSource + Send + 'static,
+    {
         let reanchor = Arc::new(AtomicBool::new(false));
         let gone = Arc::new(AtomicBool::new(false));
         let published: Arc<StdMutex<Vec<KioskView>>> = Arc::new(StdMutex::new(Vec::new()));
@@ -3032,6 +3062,7 @@ mod tests {
         let handle = spawn_kiosk_poller_with(
             &reanchor,
             &gone,
+            &Arc::new(AtomicBool::new(read_now)),
             KioskPollerTiming {
                 interval: Duration::from_millis(1),
                 motion_interval: Duration::from_millis(1),
@@ -3093,6 +3124,29 @@ mod tests {
         );
     }
 
+    /// One still look is not a settle on its own, so a pane seen once and then lost never
+    /// publishes. The hotkey's read-now request is the exception: the player asked, and the
+    /// look that is still right now is the one to read.
+    #[test]
+    fn a_hotkey_read_request_reads_on_the_first_still_look() {
+        let script = || {
+            ScriptedKiosk::new(vec![Ok(KioskRead {
+                cells: vec![scripted_cell("Titania Prime Systems Blueprint")],
+                basket: vec![],
+            })])
+            .with_profiles(vec![Some(label_strip())])
+        };
+        let (_, _, unasked) = run_poller_asked(script(), Vec::new(), false);
+        assert!(
+            unasked.lock().expect("published").is_empty(),
+            "one still look waits for a second"
+        );
+        let (_, _, asked) = run_poller_asked(script(), Vec::new(), true);
+        let asked = asked.lock().expect("published");
+        assert_eq!(asked.len(), 1, "the requested read published at once");
+        assert_eq!(asked[0].cells[0].name, "Titania Prime Systems Blueprint");
+    }
+
     /// The poller does not decide whether the kiosk is there. A pane it cannot read costs that
     /// look and nothing else (no close, no cleared view), because EE.log owns presence and
     /// says so within ~150ms. (Inferring presence from the reader's failures is what tore the
@@ -3135,6 +3189,7 @@ mod tests {
         let handle = spawn_kiosk_poller_with(
             &reanchor,
             &gone,
+            &Arc::new(AtomicBool::new(false)),
             KioskPollerTiming {
                 interval: Duration::from_millis(1),
                 motion_interval: Duration::from_millis(1),
@@ -3178,6 +3233,7 @@ mod tests {
         let handle = spawn_kiosk_poller_with(
             &reanchor,
             &gone,
+            &Arc::new(AtomicBool::new(false)),
             KioskPollerTiming {
                 interval: Duration::from_millis(1),
                 motion_interval: Duration::from_millis(1),
@@ -3929,6 +3985,7 @@ mod tests {
             let handle = spawn_kiosk_poller_with(
                 &reanchor,
                 &gone,
+                &Arc::new(AtomicBool::new(false)),
                 KioskPollerTiming {
                     interval: Duration::from_millis(1),
                     motion_interval: Duration::from_millis(1),
@@ -4049,6 +4106,7 @@ mod tests {
             let handle = spawn_kiosk_poller_with(
                 &reanchor,
                 &gone,
+                &Arc::new(AtomicBool::new(false)),
                 KioskPollerTiming {
                     interval: Duration::from_millis(1),
                     motion_interval: Duration::from_millis(1),
@@ -4211,6 +4269,7 @@ mod tests {
             let handle = spawn_kiosk_poller_with(
                 &reanchor,
                 &gone,
+                &Arc::new(AtomicBool::new(false)),
                 KioskPollerTiming {
                     interval: Duration::from_millis(1),
                     motion_interval: Duration::from_millis(1),

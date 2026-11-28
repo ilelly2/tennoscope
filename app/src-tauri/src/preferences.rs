@@ -5,10 +5,14 @@ use atomicwrites::{AtomicFile, OverwriteBehavior};
 use serde::{Deserialize, Serialize};
 
 /// Overlay preferences the backend owns, so the overlays never read browser storage for them.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Preferences {
     #[serde(default = "marks_on")]
     pub mastery_marks: bool,
+    /// The Ducat Kiosk price hotkey as an accelerator (`F8`, `Ctrl+Shift+P`). None until the
+    /// player picks one: any default would be a key some player already uses in the game.
+    #[serde(default)]
+    pub kiosk_hotkey: Option<String>,
 }
 
 fn marks_on() -> bool {
@@ -19,6 +23,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             mastery_marks: true,
+            kiosk_hotkey: None,
         }
     }
 }
@@ -34,8 +39,8 @@ pub fn load_preferences(path: &Path) -> Preferences {
 
 /// Written atomically like the setup status: a crash mid-write leaves the previous file,
 /// never half a JSON document.
-pub fn save_preferences(path: &Path, preferences: Preferences) -> std::io::Result<()> {
-    let serialized = serde_json::to_vec(&preferences).map_err(std::io::Error::other)?;
+pub fn save_preferences(path: &Path, preferences: &Preferences) -> std::io::Result<()> {
+    let serialized = serde_json::to_vec(preferences).map_err(std::io::Error::other)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -68,11 +73,26 @@ mod tests {
         let path = dir.path().join("tennoscope-preferences.json");
         save_preferences(
             &path,
-            Preferences {
+            &Preferences {
                 mastery_marks: false,
+                kiosk_hotkey: Some("Ctrl+Shift+P".to_owned()),
             },
         )
         .unwrap();
-        assert!(!load_preferences(&path).mastery_marks);
+        let loaded = load_preferences(&path);
+        assert!(!loaded.mastery_marks);
+        assert_eq!(loaded.kiosk_hotkey.as_deref(), Some("Ctrl+Shift+P"));
+    }
+
+    /// Files written before the hotkey existed hold only the marks; they must keep the marks
+    /// choice and come back with no hotkey, not fall back to defaults wholesale.
+    #[test]
+    fn a_file_from_before_the_hotkey_keeps_its_marks_and_has_no_hotkey() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tennoscope-preferences.json");
+        std::fs::write(&path, br#"{"mastery_marks":false}"#).unwrap();
+        let loaded = load_preferences(&path);
+        assert!(!loaded.mastery_marks);
+        assert_eq!(loaded.kiosk_hotkey, None);
     }
 }

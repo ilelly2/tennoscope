@@ -119,9 +119,10 @@ export const setAccessMode = (accessMode: AccessMode) => invoke<SetupStatus>('se
 export const authorizeScreenCapture = () => invoke<SetupStatus>('authorize_screen_capture')
 
 /** Overlay preferences the backend owns; the overlays never read browser storage for them. */
-export interface Preferences { mastery_marks: boolean }
+export interface Preferences { mastery_marks: boolean, kiosk_hotkey?: string | null }
 export const getPreferences = () => invoke<Preferences>('get_preferences')
 export const setMasteryMarks = (enabled: boolean) => invoke<Preferences>('set_mastery_marks', { enabled })
+export const setKioskHotkey = (accelerator: string | null) => invoke<Preferences>('set_kiosk_hotkey', { accelerator })
 
 export const marketStatus = () => invoke<AppView>('market_status')
 export const marketSignIn = (email: string, password: string) => invoke<AppView>('market_sign_in', { email, password })

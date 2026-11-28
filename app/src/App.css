@@ -1503,3 +1503,11 @@ svg.set-glyph { background: none; fill: currentColor; padding: .125rem; }
 .update-channel summary { cursor: pointer; padding: .3em 0; min-height: 24px; }
 .update-channel .check-row { margin-top: .4em; }
 .capture-status:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+
+/* The kiosk hotkey row: the key as the keyboard names it, then the buttons that change it. */
+.hotkey-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--step); }
+.hotkey-current {
+  padding: .2rem .5rem; border: 1px solid var(--rule);
+  background: var(--plate); color: var(--platinum);
+  font-family: var(--face-register); font-size: .8rem;
+}

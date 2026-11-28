@@ -37,6 +37,8 @@ warframe-market = { path = "../../crates/warframe-market" }
 warframe-status = { path = "../../crates/warframe-status" }
 regex = "1"
 tauri-plugin-process = "2"
+# The Ducat Kiosk price hotkey. Registered from Rust only, so no JS binding or capability.
+tauri-plugin-global-shortcut = "2"
 semver = "1"
 url = "2"
 time = { version = "0.3", features = ["formatting"] }

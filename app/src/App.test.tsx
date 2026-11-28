@@ -8,7 +8,7 @@ const backend = vi.hoisted(() => ({
   refreshOrders: vi.fn(), removeOrder: vi.fn(), setOrderQuantity: vi.fn(),
   setMarketPresence: vi.fn(), createOrder: vi.fn(), updateOrder: vi.fn(),
   getVersionInfo: vi.fn(), updateCheck: vi.fn(), updateDownloadAndInstall: vi.fn(),
-  getPreferences: vi.fn(), setMasteryMarks: vi.fn(),
+  getPreferences: vi.fn(), setMasteryMarks: vi.fn(), setKioskHotkey: vi.fn(),
 }))
 const overlay = vi.hoisted(() => ({
   showRewardOverlay: vi.fn(),
@@ -189,6 +189,7 @@ describe('MVP desktop interface', () => {
     // the tests that never touch the switch.
     backend.getPreferences.mockResolvedValue({ mastery_marks: true })
     backend.setMasteryMarks.mockResolvedValue({ mastery_marks: true })
+    backend.setKioskHotkey.mockImplementation(async (accelerator: string | null) => ({ mastery_marks: true, kiosk_hotkey: accelerator }))
     overlay.hideRewardOverlay.mockResolvedValue(undefined)
     overlay.getRewardOverlayVisibility.mockResolvedValue(false)
     // The backend owns the strip's visibility and reports the new state once a command lands.
@@ -1713,6 +1714,61 @@ describe('MVP desktop interface', () => {
 
     expect(await within(masterySetting()).findByRole('status')).toHaveTextContent('Could not save this setting.')
     expect(toggle).toHaveAttribute('aria-checked', 'true')
+  })
+
+  function hotkeySetting() {
+    return screen.getByRole('heading', { name: 'Ducat Kiosk price hotkey' }).closest('.setting') as HTMLElement
+  }
+
+  it('starts with no kiosk hotkey and records the next key pressed', async () => {
+    backend.getPreferences.mockResolvedValue({ mastery_marks: true, kiosk_hotkey: null })
+    await openSettings()
+
+    await waitFor(() => expect(within(hotkeySetting()).getByText('Not set')).toBeInTheDocument())
+    await userEvent.click(within(hotkeySetting()).getByRole('button', { name: 'Set key' }))
+    const listening = within(hotkeySetting()).getByRole('button', { name: 'Press a key…' })
+    // Modifiers alone keep it listening; the key that completes the combination is the one.
+    fireEvent.keyDown(listening, { key: 'Control', code: 'ControlLeft', ctrlKey: true })
+    expect(backend.setKioskHotkey).not.toHaveBeenCalled()
+    fireEvent.keyDown(listening, { key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true })
+
+    expect(backend.setKioskHotkey).toHaveBeenCalledWith('Ctrl+Shift+P')
+    expect(await within(hotkeySetting()).findByText('Ctrl+Shift+P')).toBeInTheDocument()
+  })
+
+  it('clears the kiosk hotkey', async () => {
+    backend.getPreferences.mockResolvedValue({ mastery_marks: true, kiosk_hotkey: 'F8' })
+    await openSettings()
+
+    await waitFor(() => expect(within(hotkeySetting()).getByText('F8')).toBeInTheDocument())
+    await userEvent.click(within(hotkeySetting()).getByRole('button', { name: 'Clear' }))
+    expect(backend.setKioskHotkey).toHaveBeenCalledWith(null)
+    expect(await within(hotkeySetting()).findByText('Not set')).toBeInTheDocument()
+  })
+
+  it('cancels with Escape and refuses a bare letter without asking the backend', async () => {
+    backend.getPreferences.mockResolvedValue({ mastery_marks: true, kiosk_hotkey: null })
+    await openSettings()
+
+    await userEvent.click(await within(hotkeySetting()).findByRole('button', { name: 'Set key' }))
+    fireEvent.keyDown(within(hotkeySetting()).getByRole('button', { name: 'Press a key…' }), { key: 'p', code: 'KeyP' })
+    expect(within(hotkeySetting()).getByRole('status')).toHaveTextContent('Add Ctrl or Alt to a letter, number or Space.')
+    fireEvent.keyDown(within(hotkeySetting()).getByRole('button', { name: 'Press a key…' }), { key: 'Escape', code: 'Escape' })
+
+    expect(within(hotkeySetting()).getByRole('button', { name: 'Set key' })).toBeInTheDocument()
+    expect(backend.setKioskHotkey).not.toHaveBeenCalled()
+  })
+
+  it('keeps the old key and says why when the backend refuses one', async () => {
+    backend.getPreferences.mockResolvedValue({ mastery_marks: true, kiosk_hotkey: 'F8' })
+    backend.setKioskHotkey.mockRejectedValue('that key is already taken by Windows or another program')
+    await openSettings()
+
+    await userEvent.click(await within(hotkeySetting()).findByRole('button', { name: 'Set key' }))
+    fireEvent.keyDown(within(hotkeySetting()).getByRole('button', { name: 'Press a key…' }), { key: 'F9', code: 'F9' })
+
+    expect(await within(hotkeySetting()).findByRole('status')).toHaveTextContent('That key is already taken by Windows or another program.')
+    expect(within(hotkeySetting()).getByText('F8')).toBeInTheDocument()
   })
 
   it('keeps the switch usable and says so when the setting cannot be read', async () => {
