@@ -61,10 +61,30 @@ function stripMaxWidth(held: number): string {
   return `calc(${TILE_W - clearance} * var(--h))`
 }
 
-function gridChipStyle(col: number, row: number): React.CSSProperties {
+/* The grid pane's clip edges in design px (measured on a live frame), and how far below a card's
+ * top its name begins (`LABEL_DY` in kiosk_geometry.rs). */
+const PANE_TOP = 193
+const PANE_BOTTOM_INSET = 97
+const LABEL_DY = 122
+/* A chip's rendered height: 17px figures plus 2px padding top and bottom, rounded up. */
+const CHIP_H = 24
+
+/**
+ * A chip's top inside the scrolling layer. Normally the card's own corner; but a card scrolled
+ * partly behind the pane's top edge takes its corner, and the chip on it, out of view while its
+ * name is still on screen and still read. Such a chip drops to the pane edge, and never further
+ * than one chip-height above the name, so it cannot cover the text it prices.
+ */
+function chipTop(row: number, offset: number): number {
+  const corner = Math.round(ROW_TOPS[row] * CAL)
+  const paneEdge = PANE_TOP - offset
+  return Math.min(Math.max(corner, paneEdge), corner + LABEL_DY - CHIP_H)
+}
+
+function gridChipStyle(col: number, row: number, offset: number): React.CSSProperties {
   return {
     left: cx(COL_RIGHTS[col]),
-    top: y(ROW_TOPS[row]),
+    top: `calc(${chipTop(row, offset)} * var(--h))`,
     transform: 'translateX(-100%)',
   }
 }
@@ -88,7 +108,7 @@ const noteStyle: React.CSSProperties = { left: dx(NOTE_LEFT), top: y(fx(NOTE_TOP
 
 /** An unmastered part in place of its price chip. Installed fonts decide its real width, so the
  * built box is measured and detail drops until it fits; the word and the price never drop. */
-function MasteryStrip({ cell, mastery }: { cell: CellChip, mastery: KioskMastery }) {
+function MasteryStrip({ cell, mastery, offset }: { cell: CellChip, mastery: KioskMastery, offset: number }) {
   const [tier, setTier] = useState<1 | 2 | 3>(1)
   const strip = useRef<HTMLSpanElement>(null)
   const fitted = useRef('')
@@ -116,7 +136,7 @@ function MasteryStrip({ cell, mastery }: { cell: CellChip, mastery: KioskMastery
     className="kiosk-chip kiosk-strip-chip"
     data-testid="kiosk-mastery-strip"
     data-tier={tier}
-    style={{ ...gridChipStyle(cell.col, cell.row), maxWidth: stripMaxWidth(mastery.held) }}
+    style={{ ...gridChipStyle(cell.col, cell.row, offset), maxWidth: stripMaxWidth(mastery.held) }}
     title={cell.name}
   >
     <span className="kiosk-fact">Unmastered</span>
@@ -258,19 +278,19 @@ export default function KioskOverlay() {
           // row sliding out of the pane must slide out of the overlay too, instead of
           // painting its chips over the header. The inset is undone by the same translate
           // the chips ride, so it is expressed against the untranslated box.
-          clipPath: `inset(calc(${193 - offset} * var(--h)) 0 calc(${97 + offset} * var(--h)) 0)`,
+          clipPath: `inset(calc(${PANE_TOP - offset} * var(--h)) 0 calc(${PANE_BOTTOM_INSET + offset} * var(--h)) 0)`,
         }}
       >
         {view?.cells.map(cell =>
           // Only this run's live inventory backs a strip; without it the tile stays priced, since
           // a strip would brand every part on screen unmastered.
           masteryLive && cell.mastery
-            ? <MasteryStrip key={`${cell.col}:${cell.row}`} cell={cell} mastery={cell.mastery}/>
+            ? <MasteryStrip key={`${cell.col}:${cell.row}`} cell={cell} mastery={cell.mastery} offset={offset}/>
             : <span
               key={`${cell.col}:${cell.row}`}
               className="kiosk-chip"
               data-testid="kiosk-grid-chip"
-              style={gridChipStyle(cell.col, cell.row)}
+              style={gridChipStyle(cell.col, cell.row, offset)}
               title={cell.name}
             >
               <MetalMark metal="plat" className="kiosk-mark"/>{cell.platinum}p

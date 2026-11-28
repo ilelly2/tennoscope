@@ -201,6 +201,38 @@ describe('kiosk overlay route', () => {
     expect(grid).not.toHaveClass('kiosk-faded')
   })
 
+  it('keeps a half-hidden top row priced inside the pane', async () => {
+    // Scrolled 100 design px: row 0's card top sits at 99, behind the pane's 193 clip edge,
+    // while its name (top + 122) is still on screen. A chip left at the card corner would be
+    // clipped away with it, so it drops to the pane edge in the layer's own coordinates.
+    await renderKiosk(kioskView({
+      scroll_dy: -100,
+      cells: [tile({ col: 0, row: 0, platinum: 29 }), tile({ col: 0, row: 1, platinum: 4 })],
+    }))
+    const [top, second] = await screen.findAllByTestId('kiosk-grid-chip')
+    expect(top).toHaveStyle({ top: 'calc(293 * var(--h))' })
+    // A row whose corner is visible keeps its corner.
+    expect(second).toHaveStyle({ top: 'calc(421 * var(--h))' })
+  })
+
+  it('never lowers a top-row chip onto its card name', async () => {
+    // Scrolled 200: the pane edge (393 in layer terms) is past where the name starts, so the
+    // chip stops one chip-height above the name and rides out of the pane with its card.
+    await renderKiosk(kioskView({ scroll_dy: -200, cells: [tile({ col: 0, row: 0, platinum: 29 })] }))
+    const [chip] = await screen.findAllByTestId('kiosk-grid-chip')
+    expect(chip).toHaveStyle({ top: 'calc(297 * var(--h))' })
+  })
+
+  it('keeps a half-hidden unmastered strip inside the pane too', async () => {
+    await renderKiosk(kioskView({
+      scroll_dy: -100,
+      mastery_status: 'live',
+      cells: [tile({ col: 0, row: 0, platinum: 29, mastery: { held: 0, uses: 1 } })],
+    }))
+    const strip = await screen.findByTestId('kiosk-mastery-strip')
+    expect(strip).toHaveStyle({ top: 'calc(293 * var(--h))' })
+  })
+
   it('re-anchors to a settled read even when nothing re-anchored', async () => {
     render(<AppRoute pathname="/kiosk" />)
     const grid = await screen.findByTestId('kiosk-grid')
